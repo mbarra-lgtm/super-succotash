@@ -1,0 +1,32 @@
+# ── Secretos / entorno ──────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+*.env
+
+# ── Estado de sync (cursores locales) ───────────────────────────────
+.cursor_*.json
+.backfill_checkpoint.json
+**/.cursor_*.json
+
+# ── Python ──────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# ── Logs ────────────────────────────────────────────────────────────
+logs/
+*.log
+
+# ── Datos pesados / adjuntos (no versionar) ─────────────────────────
+*.pdf
+*.xlsx
+*.xls
+*.csv
+*.zip
+*.docx
+*.ipynb
+*.sql

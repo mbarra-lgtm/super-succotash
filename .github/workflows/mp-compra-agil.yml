@@ -1,0 +1,33 @@
+name: MP · Compra Ágil (cada 2h)
+
+on:
+  schedule:
+    - cron: "5 */2 * * *"      # cada 2 horas, minuto 5 (UTC)
+  workflow_dispatch:            # permite correr a mano
+
+concurrency:
+  group: mp-compra-agil
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30       # tope de seguridad: el cursor se guarda tras el listado
+    defaults:
+      run:
+        working-directory: mp_sync
+    env:
+      SUPABASE_URL:         ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+      TICKET_CA:            ${{ secrets.TICKET_CA }}
+      CURSOR_BACKEND:       supabase
+      SLEEP_BETWEEN:        "2.0"
+      CA_VENTANA_HORAS:     "2"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - run: python sync_compra_agil.py

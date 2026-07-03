@@ -1,0 +1,38 @@
+name: MP · Estados + CRM (diario)
+
+on:
+  schedule:
+    - cron: "0 10 * * *"       # 10:00 UTC ≈ 06:00 Chile
+  workflow_dispatch:
+
+concurrency:
+  group: mp-diario
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    defaults:
+      run:
+        working-directory: mp_sync
+    env:
+      SUPABASE_URL:         ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+      TICKET_ACTIVAS:       ${{ secrets.TICKET_ACTIVAS }}
+      TICKET_CRM:           ${{ secrets.TICKET_CRM }}
+      CURSOR_BACKEND:       supabase
+      SLEEP_BETWEEN:        "2.0"
+      ESTADOS_DIAS_ATRAS:   "2"
+      CRM_LIMIT:            "2000"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Estados diario (adjudicadas/desiertas/etc)
+        run: python sync_estados_diario.py
+      - name: CRM
+        run: python sync_crm.py

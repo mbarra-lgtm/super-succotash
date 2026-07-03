@@ -1,0 +1,46 @@
+name: MP · Backfill nocturno (estados + OC detalle)
+
+on:
+  schedule:
+    - cron: "30 4 * * *"       # 04:30 UTC ≈ 00:30 Chile (un lote por noche)
+  workflow_dispatch:
+    inputs:
+      lote_estados:
+        description: "Tamaño lote backfill estados licitaciones"
+        default: "1500"
+      lote_oc:
+        description: "Tamaño lote backfill detalle OC"
+        default: "1500"
+
+concurrency:
+  group: mp-backfill
+  cancel-in-progress: false
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    defaults:
+      run:
+        working-directory: mp_sync
+    env:
+      SUPABASE_URL:         ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+      TICKET_ACTIVAS:       ${{ secrets.TICKET_ACTIVAS }}
+      TICKET_OC:            ${{ secrets.TICKET_OC }}
+      CURSOR_BACKEND:       supabase
+      SLEEP_BETWEEN:        "2.0"
+      SLEEP_BETWEEN_OC:     "3.0"
+      BACKFILL_LOTE:        ${{ github.event.inputs.lote_estados || '1500' }}
+      BACKFILL_OC_LOTE:     ${{ github.event.inputs.lote_oc || '1500' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Backfill estados licitaciones
+        run: python backfill_estados_lic.py
+      - name: Backfill detalle OC
+        run: python backfill_oc_detalle.py
