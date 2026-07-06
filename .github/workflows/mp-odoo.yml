@@ -24,7 +24,9 @@ jobs:
       WORK_START_HOUR:          "7"
       WORK_END_HOUR:            "19"
       SUPABASE_URL:             ${{ secrets.SUPABASE_URL }}
+      # el script acepta cualquiera de los dos; reusa el SUPABASE_SERVICE_KEY que ya cargaste
       SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      SUPABASE_SERVICE_KEY:     ${{ secrets.SUPABASE_SERVICE_KEY }}
       ODOO_JSONRPC:             ${{ secrets.ODOO_JSONRPC }}
       ODOO_DB:                  ${{ secrets.ODOO_DB }}
       ODOO_USER:                ${{ secrets.ODOO_USER }}
