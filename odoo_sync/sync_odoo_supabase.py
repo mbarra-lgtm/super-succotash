@@ -67,6 +67,14 @@ BATCH_QUANTS = int(os.getenv("BATCH_QUANTS", "1000"))
 ENABLE_SOFT_DELETE = os.getenv("ENABLE_SOFT_DELETE", "0").strip() == "1"
 SOFT_DELETE_DAYS   = int(os.getenv("SOFT_DELETE_DAYS", "5"))
 
+# Control de full-resync para runners efímeros (GitHub Actions), donde el
+# centinela por archivo NO sobrevive entre corridas:
+#   SKIP_FULL_RESYNC=1  -> nunca corre los full-resync (job frecuente cada 20 min)
+#   FORCE_FULL_RESYNC=1 -> corre los full-resync sí o sí (job diario dedicado)
+# Con ambos en 0 (default) se mantiene la lógica original por sentinel (uso local en loop).
+SKIP_FULL_RESYNC  = os.getenv("SKIP_FULL_RESYNC", "0").strip() == "1"
+FORCE_FULL_RESYNC = os.getenv("FORCE_FULL_RESYNC", "0").strip() == "1"
+
 # =========================
 # Tables
 # =========================
@@ -4322,7 +4330,8 @@ def main():
             tempfile.gettempdir(),
             f"stock_full_resync_{now_local.date().isoformat()}.done"
         )
-        if (now_local.hour >= STOCK_FULL_RESYNC_HOUR
+        if FORCE_FULL_RESYNC or (not SKIP_FULL_RESYNC
+            and now_local.hour >= STOCK_FULL_RESYNC_HOUR
             and not os.path.exists(sentinel_stock)):
             print(f"🕖 Disparando FULL resync stock ({now_local})")
             full_resync_stock_tables(odoo, run_ts_iso)
@@ -4345,7 +4354,7 @@ def main():
             tempfile.gettempdir(),
             f"purchase_orders_full_resync_{now_local.date().isoformat()}.done"
         )
-        if now_local.hour >= PURCHASE_FULL_RESYNC_HOUR and not os.path.exists(sentinel_po):
+        if FORCE_FULL_RESYNC or (not SKIP_FULL_RESYNC and now_local.hour >= PURCHASE_FULL_RESYNC_HOUR and not os.path.exists(sentinel_po)):
             print(f"🕖 Disparando FULL resync purchase_orders ({now_local})")
             sync_purchase_orders_incremental(odoo, chunk=800, full=True, run_ts_iso=run_ts_iso)
             mark_deleted_purchase_orders(run_ts_iso)
@@ -4419,7 +4428,8 @@ def main():
             f"account_moves_full_resync_{now_local.date().isoformat()}.done"
         )
 
-        if (now_local.hour >= ACCOUNT_MOVES_FULL_RESYNC_HOUR
+        if FORCE_FULL_RESYNC or (not SKIP_FULL_RESYNC
+            and now_local.hour >= ACCOUNT_MOVES_FULL_RESYNC_HOUR
             and not os.path.exists(sentinel)):
             print(f"🕖 Disparando FULL resync account_moves ({now_local})")
             full_resync_account_moves_with_archive(

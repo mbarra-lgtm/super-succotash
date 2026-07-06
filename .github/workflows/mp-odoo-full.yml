@@ -1,0 +1,39 @@
+name: Odoo → Supabase FULL resync (1x/día L-V)
+
+on:
+  schedule:
+    - cron: "0 11 * * 1-5"    # 11:00 UTC ≈ 07-08 CL (dentro de ventana laboral todo el año)
+  workflow_dispatch:
+
+concurrency:
+  group: odoo-sync            # mismo grupo que el job de 20 min → nunca corren a la vez
+  cancel-in-progress: false
+
+jobs:
+  full:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: odoo_sync
+    env:
+      RUN_ONCE:                  "1"
+      FORCE_FULL_RESYNC:         "1"   # corre stock/purchase/account_moves FULL + archivado, 1 vez
+      TZ_LOCAL:                  "America/Santiago"
+      WORK_START_HOUR:           "7"
+      WORK_END_HOUR:             "19"
+      SUPABASE_URL:              ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      SUPABASE_SERVICE_KEY:      ${{ secrets.SUPABASE_SERVICE_KEY }}
+      ODOO_JSONRPC:              ${{ secrets.ODOO_JSONRPC }}
+      ODOO_DB:                   ${{ secrets.ODOO_DB }}
+      ODOO_USER:                 ${{ secrets.ODOO_USER }}
+      ODOO_API_KEY:              ${{ secrets.ODOO_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - run: python sync_odoo_supabase.py

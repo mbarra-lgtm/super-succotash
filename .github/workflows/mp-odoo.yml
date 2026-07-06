@@ -20,6 +20,7 @@ jobs:
         working-directory: odoo_sync
     env:
       RUN_ONCE:                 "1"
+      SKIP_FULL_RESYNC:         "1"   # los full-resync diarios corren en mp-odoo-full.yml
       TZ_LOCAL:                 "America/Santiago"
       WORK_START_HOUR:          "7"
       WORK_END_HOUR:            "19"
