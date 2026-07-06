@@ -1,0 +1,39 @@
+name: Odoo → Supabase (cada 20 min, L-V 07-19 CL)
+
+on:
+  schedule:
+    # cada 20 min entre 10:00 y 23:59 UTC (cubre 07-19 hora Chile con y sin horario de verano), L-V.
+    # El script recorta el borde exacto: si no está dentro de 07-19 CL L-V, sale sin hacer nada.
+    - cron: "*/20 10-23 * * 1-5"
+  workflow_dispatch:
+
+concurrency:
+  group: odoo-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: odoo_sync
+    env:
+      RUN_ONCE:                 "1"
+      TZ_LOCAL:                 "America/Santiago"
+      WORK_START_HOUR:          "7"
+      WORK_END_HOUR:            "19"
+      SUPABASE_URL:             ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      ODOO_JSONRPC:             ${{ secrets.ODOO_JSONRPC }}
+      ODOO_DB:                  ${{ secrets.ODOO_DB }}
+      ODOO_USER:                ${{ secrets.ODOO_USER }}
+      ODOO_API_KEY:             ${{ secrets.ODOO_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - run: python sync_odoo_supabase.py
