@@ -4277,6 +4277,28 @@ def full_resync_mrp_tables(odoo: OdooClient, run_ts_iso: str) -> dict:
     return out
 
 
+def reconcile_deletions(odoo: OdooClient, model: str, table: str, run_ts_iso: str, id_chunk: int = 5000) -> None:
+    """Detección de bajas genérica (soft-delete) para tablas que YA sincronizan
+    incrementalmente por su propio write_date (no necesitan re-fetch completo de datos):
+    trae solo los IDs vivos de Odoo (liviano), estampa last_seen_at, y marca
+    is_active=false las que ya no aparecen (con umbral de seguridad en la RPC)."""
+    live_ids: List[int] = []
+    for batch in iter_search_read_all(odoo, model, [], ["id"], chunk=2000, context={"active_test": False}):
+        live_ids.extend(int(r["id"]) for r in batch)
+    for part in chunked(live_ids, id_chunk):
+        try:
+            sb.rpc("rpc_stamp_last_seen", {"p_table": table, "p_ids": part, "run_ts": run_ts_iso}).execute()
+        except Exception as e:
+            print(f"⚠️ stamp {table}: {e}")
+            return
+    try:
+        res = sb.rpc("rpc_mark_deleted_generic", {"p_table": table, "run_ts": run_ts_iso}).execute()
+        n = getattr(res, "data", None)
+        print(f"🪦 {table}: {n} marcadas baja (soft) | vivos_odoo={len(live_ids)}")
+    except Exception as e:
+        print(f"⚠️ reconcile {table}: {e}")
+
+
 # =========================
 # Main
 # =========================
@@ -4514,6 +4536,14 @@ def main():
             and now_local.hour >= STOCK_FULL_RESYNC_HOUR
             and not os.path.exists(sentinel_mrp)):
             full_resync_mrp_tables(odoo, run_ts_iso)
+            # Detección de bajas en líneas de OC/NV, cabeceras de venta y oportunidades CRM
+            for _model, _table in [
+                ("purchase.order.line", "purchase_order_lines"),
+                ("sale.order.line",     "sale_order_lines"),
+                ("sale.order",          "sales_notes"),
+                ("crm.lead",            "crm_projects"),
+            ]:
+                reconcile_deletions(odoo, _model, _table, run_ts_iso)
             with open(sentinel_mrp, "w") as f:
                 f.write(now_local.isoformat())
         else:
