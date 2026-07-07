@@ -2604,10 +2604,11 @@ def backfill_missing_account_moves(odoo: OdooClient, limit_ids: int = 20000, chu
 # =========================
 CTX_ALL = {"active_test": False}
 
-def sync_manufacturing_orders_incremental(odoo: OdooClient, chunk: int = 800) -> Tuple[List[int], List[int], List[int]]:
+def sync_manufacturing_orders_incremental(odoo: OdooClient, chunk: int = 800,
+                                          full: bool = False, run_ts_iso: Optional[str] = None) -> Tuple[List[int], List[int], List[int]]:
     model = "mrp.production"
     table = TB_MO
- 
+
     desired = [
         "id", "name", "origin", "state",
         "product_id", "product_qty",
@@ -2616,10 +2617,10 @@ def sync_manufacturing_orders_incremental(odoo: OdooClient, chunk: int = 800) ->
         "write_date", "bom_id", "procurement_group_id", "latest_bom_id",
     ]
     fields = available_fields(odoo, model, desired)
- 
+
     last = sb_get_max_write_date(table)
     domain: list = []
-    if last:
+    if last and not full:                               # full=True → trae TODO lo vivo (para reconciliar bajas)
         domain.append(["write_date", ">", last])
  
     total = 0
@@ -2643,7 +2644,7 @@ def sync_manufacturing_orders_incremental(odoo: OdooClient, chunk: int = 800) ->
             if pg_id:
                 group_ids.append(pg_id)
  
-            rows.append({
+            row = {
                 "odoo_id": mo_id,
                 "name": r.get("name"),
                 "origin": r.get("origin"),
@@ -2658,12 +2659,19 @@ def sync_manufacturing_orders_incremental(odoo: OdooClient, chunk: int = 800) ->
                 "date_finished": parse_odoo_dt(r.get("date_finished")),
                 "create_date": parse_odoo_dt(r.get("create_date")),   # ← NUEVO
                 "write_date": parse_odoo_dt(r.get("write_date")),
-            })
- 
+            }
+            # Reconciliación de bajas: en la pasada full estampamos last_seen_at y
+            # reactivamos (una fila vista sigue viva). Las no vistas las marca la RPC.
+            if full and run_ts_iso:
+                row["last_seen_at"] = run_ts_iso
+                row["is_active"] = True
+                row["missing_since"] = None
+            rows.append(row)
+
         sb_upsert_basic(table, rows, on_conflict="odoo_id", batch_size=1000)
         total += len(rows)
- 
-    print(f"✅ MO incremental: {total} filas (desde write_date>{last})")
+
+    print(f"✅ MO {'FULL' if full else 'incremental'}: {total} filas (desde write_date>{last if not full else 'ALL'})")
     return uniq_ints(mo_ids), uniq_ints(bom_ids), uniq_ints(group_ids)
 
 
@@ -4115,11 +4123,15 @@ def backfill_account_moves_until_done(
 
     return total_inserted
 
-def sync_all_boms_incremental(odoo: OdooClient, chunk: int = 800) -> int:
+def sync_all_boms_incremental(odoo: OdooClient, chunk: int = 800,
+                              full: bool = False, run_ts_iso: Optional[str] = None) -> int:
     """
     Sincroniza TODOS los mrp.bom (no solo los referenciados por OFs).
     Esto captura BOMs de productos que aún no tienen Manufacturing Orders,
     típicamente semi-elaborados y productos terminados nuevos.
+
+    full=True → trae TODO lo vivo (sin filtro write_date) y estampa last_seen_at
+    para reconciliar bajas (unlink) en Odoo.
     """
     model = "mrp.bom"
     table = TB_BOM
@@ -4134,7 +4146,7 @@ def sync_all_boms_incremental(odoo: OdooClient, chunk: int = 800) -> int:
 
     last = sb_get_max_write_date(table)
     domain: list = []
-    if last:
+    if last and not full:
         domain.append(["write_date", ">", last])
 
     total = 0
@@ -4152,7 +4164,7 @@ def sync_all_boms_incremental(odoo: OdooClient, chunk: int = 800) -> int:
             uom_id, uom_name = m2o(r.get("product_uom_id"))
             company_id, company_name = m2o(r.get("company_id"))
 
-            rows.append({
+            row = {
                 "odoo_id": bom_id,
                 "code": r.get("code"),
                 "active": r.get("active"),
@@ -4167,22 +4179,30 @@ def sync_all_boms_incremental(odoo: OdooClient, chunk: int = 800) -> int:
                 "company_id": company_id,
                 "company_name": company_name,
                 "write_date": parse_odoo_dt(r.get("write_date")),
-            })
+            }
+            if full and run_ts_iso:
+                row["last_seen_at"] = run_ts_iso
+                row["is_active"] = True
+                row["missing_since"] = None
+            rows.append(row)
 
         sb_upsert_basic(TB_BOM, rows, on_conflict="odoo_id", batch_size=1000)
         total += len(rows)
 
-    print(f"✅ mrp_boms FULL incremental: {total} filas sincronizadas (desde write_date>{last})")
+    print(f"✅ mrp_boms {'FULL' if full else 'incremental'}: {total} filas (desde write_date>{last if not full else 'ALL'})")
 
-    # Ahora sincronizar las líneas de TODOS los BOMs nuevos
+    # Ahora sincronizar las líneas de TODOS los BOMs sincronizados
     if bom_ids_synced:
-        sync_bom_lines_only(odoo, uniq_ints(bom_ids_synced), chunk_ids=300)
+        sync_bom_lines_only(odoo, uniq_ints(bom_ids_synced), chunk_ids=300,
+                            full=full, run_ts_iso=run_ts_iso)
 
     return total
 
 
-def sync_bom_lines_only(odoo: OdooClient, bom_ids: List[int], chunk_ids: int = 300) -> int:
-    """Sincroniza solo las líneas de los BOMs especificados (sin tocar los headers)."""
+def sync_bom_lines_only(odoo: OdooClient, bom_ids: List[int], chunk_ids: int = 300,
+                        full: bool = False, run_ts_iso: Optional[str] = None) -> int:
+    """Sincroniza solo las líneas de los BOMs especificados (sin tocar los headers).
+    full=True → estampa last_seen_at en cada línea vigente (para reconciliar bajas)."""
     if not bom_ids:
         return 0
 
@@ -4203,7 +4223,7 @@ def sync_bom_lines_only(odoo: OdooClient, bom_ids: List[int], chunk_ids: int = 3
             child_bom_id, _ = m2o(r.get("child_bom_id"))
             op_id, op_name = m2o(r.get("operation_id"))
 
-            line_rows.append({
+            row = {
                 "odoo_id": int(r["id"]),
                 "bom_id": bom_id,
                 "bom_name": bom_name,
@@ -4216,11 +4236,45 @@ def sync_bom_lines_only(odoo: OdooClient, bom_ids: List[int], chunk_ids: int = 3
                 "operation_name": op_name,
                 "child_bom_id": child_bom_id,
                 "write_date": parse_odoo_dt(r.get("write_date")),
-            })
+            }
+            if full and run_ts_iso:
+                row["last_seen_at"] = run_ts_iso
+                row["is_active"] = True
+                row["missing_since"] = None
+            line_rows.append(row)
 
     sb_upsert_basic(TB_BOM_LINES, line_rows, on_conflict="odoo_id", batch_size=1000)
-    print(f"✅ mrp_bom_lines: {len(line_rows)} líneas sincronizadas")
+    print(f"✅ mrp_bom_lines{' FULL' if full else ''}: {len(line_rows)} líneas sincronizadas")
     return len(line_rows)
+
+
+def full_resync_mrp_tables(odoo: OdooClient, run_ts_iso: str) -> dict:
+    """
+    FULL resync de mrp_boms / mrp_bom_lines / manufacturing_orders + reconciliación
+    de bajas (soft-delete). El incremental por write_date NO detecta unlinks en Odoo;
+    esto trae TODO lo vivo (estampa last_seen_at) y marca is_active=false a lo que
+    ya no aparece. Correr 1x/día (bloque FORCE_FULL_RESYNC).
+    """
+    print(f"🔄 FULL resync MRP (boms/lines/MO) + reconciliación | run_ts={run_ts_iso}")
+    sync_all_boms_incremental(odoo, chunk=800, full=True, run_ts_iso=run_ts_iso)          # boms + líneas
+    sync_manufacturing_orders_incremental(odoo, chunk=800, full=True, run_ts_iso=run_ts_iso)  # OFs
+
+    out = {}
+    for fn, label in [
+        ("rpc_mark_deleted_mrp_boms", "mrp_boms"),
+        ("rpc_mark_deleted_mrp_bom_lines", "mrp_bom_lines"),
+        ("rpc_mark_deleted_manufacturing_orders", "manufacturing_orders"),
+    ]:
+        try:
+            res = sb.rpc(fn, {"run_ts": run_ts_iso}).execute()
+            n = getattr(res, "data", None)
+            n = int(n) if isinstance(n, (int, float)) else 0
+            out[label] = n
+            print(f"🪦 {label}: {n} marcadas como baja (soft-delete)")
+        except Exception as e:
+            out[label] = f"error: {e}"
+            print(f"⚠️ reconciliación {label}: {e}")
+    return out
 
 
 # =========================
@@ -4445,6 +4499,28 @@ def main():
                   f"sentinel={'existe' if os.path.exists(sentinel) else 'no existe'})")
     except Exception as e:
         print(f"⚠️ FULL resync account_moves: {e}")
+
+    # ============================================================
+    # FULL resync MRP (boms / bom_lines / OFs) + reconciliación de bajas (1x/día)
+    # ============================================================
+    try:
+        now_local = datetime.now(TZ_LOCAL)
+        import tempfile
+        sentinel_mrp = os.path.join(
+            tempfile.gettempdir(),
+            f"mrp_full_resync_{now_local.date().isoformat()}.done"
+        )
+        if FORCE_FULL_RESYNC or (not SKIP_FULL_RESYNC
+            and now_local.hour >= STOCK_FULL_RESYNC_HOUR
+            and not os.path.exists(sentinel_mrp)):
+            full_resync_mrp_tables(odoo, run_ts_iso)
+            with open(sentinel_mrp, "w") as f:
+                f.write(now_local.isoformat())
+        else:
+            print(f"⏭️  FULL resync MRP: skip "
+                  f"(hora={now_local.hour}, skip={SKIP_FULL_RESYNC}, force={FORCE_FULL_RESYNC})")
+    except Exception as e:
+        print(f"⚠️ FULL resync MRP: {e}")
 
     try:
         sync_account_analytic_lines_incremental(odoo, run_ts_iso, chunk=1500)
