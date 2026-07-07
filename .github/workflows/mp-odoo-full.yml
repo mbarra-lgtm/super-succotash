@@ -1,8 +1,7 @@
 name: Odoo → Supabase FULL resync (1x/día L-V)
 
 on:
-  schedule:
-    - cron: "0 11 * * 1-5"    # 11:00 UTC ≈ 07-08 CL (dentro de ventana laboral todo el año)
+  # Disparado por pg_cron en Supabase (job 'dispatch-mp-odoo-full') vía workflow_dispatch.
   workflow_dispatch:
 
 concurrency:

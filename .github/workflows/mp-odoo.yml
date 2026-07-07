@@ -1,10 +1,8 @@
 name: Odoo → Supabase (cada 20 min, L-V 07-19 CL)
 
 on:
-  schedule:
-    # cada 20 min entre 10:00 y 23:59 UTC (cubre 07-19 hora Chile con y sin horario de verano), L-V.
-    # El script recorta el borde exacto: si no está dentro de 07-19 CL L-V, sale sin hacer nada.
-    - cron: "*/20 10-23 * * 1-5"
+  # Disparado por pg_cron en Supabase (job 'dispatch-mp-odoo') vía workflow_dispatch.
+  # Sin 'schedule' nativo a propósito: el cron de GitHub es best-effort y duplicaría runs.
   workflow_dispatch:
 
 concurrency:
