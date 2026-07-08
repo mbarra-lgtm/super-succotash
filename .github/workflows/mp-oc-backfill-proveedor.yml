@@ -1,0 +1,40 @@
+name: MP · Backfill OC por proveedor (grupo + competidores)
+
+on:
+  schedule:
+    - cron: "0 2 * * *"       # 02:00 UTC — drena en varias noches; desactivar cuando termine
+  workflow_dispatch:
+    inputs:
+      ruts:
+        description: "RUTs separados por coma (vacío = grupo+competidores por defecto)"
+        default: ""
+      max_det:
+        description: "Máx. detalles por corrida"
+        default: "3000"
+
+concurrency:
+  group: mp-oc-backfill
+  cancel-in-progress: false
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    defaults:
+      run:
+        working-directory: mp_sync
+    env:
+      SUPABASE_URL:         ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+      TICKET_OC:            ${{ secrets.TICKET_OC }}
+      SLEEP_BETWEEN_OC:     "3.0"
+      OC_PROV_MAX_DET:      ${{ github.event.inputs.max_det || '3000' }}
+      OC_BACKFILL_RUTS:     ${{ github.event.inputs.ruts || '' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - run: python backfill_oc_por_proveedor.py
