@@ -182,8 +182,9 @@ def _sync_detalle(id_mp: str):
             "id_cotizacion":          pv.get("id_cotizacion"),
             "valor_neto":             _float(pv.get("valor_neto")),
             "monto_total":            _float(pv.get("monto_total")),
-            "proveedor_seleccionado": (pv.get("seleccion") or {}).get("proveedor_seleccionado", False),
-            "motivo_seleccion":       (pv.get("seleccion") or {}).get("motivo_seleccion"),
+            # El flag viene al nivel superior del proveedor (no bajo "seleccion")
+            "proveedor_seleccionado": bool(pv.get("proveedor_seleccionado", 0)),
+            "motivo_seleccion":       pv.get("estado_por_comprador") or pv.get("justificacion_inadmisibilidad"),
         })
     if pv_rows:
         _sb_upsert(T_PROVS, "id_mp,id_cotizacion", pv_rows)
