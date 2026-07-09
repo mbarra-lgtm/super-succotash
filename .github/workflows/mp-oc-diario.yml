@@ -1,0 +1,37 @@
+name: MP · OC del día (API, 1x/día)
+
+# Frescura del mes en curso: trae las OCs de hoy/ayer vía API.
+# El grueso histórico lo consolida "MP · OC Datos Abiertos" (día 22, mes vencido).
+
+on:
+  schedule:
+    - cron: "45 9 * * *"       # 09:45 UTC ≈ 05:45-06:45 CL, antes de la jornada
+  workflow_dispatch:
+
+concurrency:
+  group: mp-oc-diario
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: mp_sync
+    env:
+      SUPABASE_URL:         ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+      TICKET_OC:            ${{ secrets.TICKET_OC }}
+      SLEEP_BETWEEN_OC:     "3.0"
+      OC_DIAS_ATRAS:        "2"
+      OC_MAX_DETALLE:       "800"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Órdenes de compra (día en curso)
+        run: python sync_oc.py

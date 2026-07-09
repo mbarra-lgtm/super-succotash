@@ -1,4 +1,4 @@
-name: MP · Licitaciones + OC (cada 2h)
+name: MP · Licitaciones (cada 2h)
 
 on:
   schedule:
@@ -12,7 +12,7 @@ concurrency:
 jobs:
   sync:
     runs-on: ubuntu-latest
-    timeout-minutes: 50
+    timeout-minutes: 40
     defaults:
       run:
         working-directory: mp_sync
@@ -20,13 +20,9 @@ jobs:
       SUPABASE_URL:         ${{ secrets.SUPABASE_URL }}
       SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
       TICKET_ACTIVAS:       ${{ secrets.TICKET_ACTIVAS }}
-      TICKET_OC:            ${{ secrets.TICKET_OC }}
       CURSOR_BACKEND:       supabase
       SLEEP_BETWEEN:        "2.0"
-      SLEEP_BETWEEN_OC:     "3.0"
       LIC_MAX_POR_RUN:      "200"
-      OC_DIAS_ATRAS:        "1"
-      OC_MAX_DETALLE:       "300"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -36,5 +32,3 @@ jobs:
       - run: pip install -r requirements.txt
       - name: Licitaciones activas
         run: python sync_activas.py
-      - name: Órdenes de compra
-        run: python sync_oc.py
