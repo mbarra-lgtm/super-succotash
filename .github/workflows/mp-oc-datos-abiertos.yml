@@ -1,0 +1,40 @@
+name: MP · OC Datos Abiertos (carga mensual masiva)
+
+on:
+  schedule:
+    - cron: "0 6 22 * *"      # día 22 de cada mes, 06:00 UTC (el mes vencido se publica ~día 20)
+  workflow_dispatch:
+    inputs:
+      meses:
+        description: "Meses a cargar, ej: 2025-12,2026-1 (vacío = dic-2025→may-2026)"
+        default: ""
+
+concurrency:
+  group: mp-oc-datos-abiertos
+  cancel-in-progress: false
+
+jobs:
+  cargar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    defaults:
+      run:
+        working-directory: mp_sync
+    env:
+      SUPABASE_URL:         ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Resolver meses (input o mes vencido)
+        run: |
+          if [ -n "${{ github.event.inputs.meses }}" ]; then
+            echo "OC_DA_MESES=${{ github.event.inputs.meses }}" >> "$GITHUB_ENV"
+          else
+            echo "OC_DA_MESES=$(date -d 'last month' +%Y-%-m)" >> "$GITHUB_ENV"
+          fi
+      - run: python ingesta_oc_datos_abiertos.py
