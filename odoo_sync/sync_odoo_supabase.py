@@ -45,6 +45,7 @@ LOOP_EVERY_SECONDS = int(os.getenv("LOOP_EVERY_SECONDS", str(20 * 60)))
 
 # Batch sizes (RPC payloads)
 BATCH_PICKINGS   = int(os.getenv("BATCH_PICKINGS", "500"))
+BATCH_PBATCHES   = int(os.getenv("BATCH_PBATCHES", "500"))
 BATCH_MOVES      = int(os.getenv("BATCH_MOVES", "500"))
 BATCH_MOVE_LINES = int(os.getenv("BATCH_MOVE_LINES", "500"))
 BATCH_AML        = int(os.getenv("BATCH_AML", "500"))
@@ -84,6 +85,7 @@ TB_MO         = "manufacturing_orders"
 TB_BOM        = "mrp_boms"
 TB_BOM_LINES  = "mrp_bom_lines"
 TB_PICKINGS   = "stock_pickings"
+TB_PICKING_BATCHES = "stock_picking_batches"
 TB_MOVES      = "stock_moves"
 TB_MOVE_LINES = "stock_move_lines"
 TB_PRODUCTS   = "product_products"
@@ -2801,6 +2803,81 @@ def sync_bom_and_lines_by_ids(odoo: OdooClient, bom_ids: List[int], chunk_ids: i
 # =========================
 # Incremental: Pickings / Moves / MoveLines (pesadas) via RPC + HASH
 # =========================
+def sync_picking_batches_incremental(odoo: OdooClient, run_ts_iso: str,
+                                     chunk: int = 500, full: bool = False) -> int:
+    """Mirror de stock.picking.batch (lotes de traslado BATCH/xxxxx y waves).
+
+    Modelo liviano: decenas de filas nuevas por semana. El link picking->batch
+    se sincroniza aparte en sync_pickings_incremental (columna batch_id).
+    """
+    model = "stock.picking.batch"
+    table = TB_PICKING_BATCHES
+
+    fields_desired = [
+        "id", "name", "state", "is_wave",
+        "user_id", "company_id", "picking_type_id",
+        "scheduled_date", "date_done", "description",
+        "create_date", "write_date",
+    ]
+    fields = available_fields(odoo, model, fields_desired)
+    ctx = {"active_test": False}
+
+    last = sb_get_max_write_date(table)
+    domain: list = []
+    if last and not full:
+        domain.append(["write_date", ">", last])
+
+    total_rows = 0
+    affected = 0
+
+    for batch in iter_search_read_all(odoo, model, domain, fields, chunk=chunk, context=ctx):
+        rows: List[dict] = []
+        for r in batch:
+            bid = int(r["id"])
+            uid, uname = m2o(r.get("user_id"))
+            cid, _ = m2o(r.get("company_id"))
+            pt_id, pt_name = m2o(r.get("picking_type_id"))
+
+            row = {
+                "odoo_id": bid,
+                "name": r.get("name"),
+                "state": r.get("state"),
+                "is_wave": bool(r.get("is_wave")),
+                "user_id": uid,
+                "user_name": uname,
+                "company_id": cid,
+                "picking_type_id": pt_id,
+                "picking_type_name": pt_name,
+                "scheduled_date": parse_odoo_dt(r.get("scheduled_date")),
+                "date_done": parse_odoo_dt(r.get("date_done")),
+                "description": r.get("description") or None,
+                "create_date": parse_odoo_dt(r.get("create_date")),
+                "write_date": parse_odoo_dt(r.get("write_date")),
+                "last_seen_at": run_ts_iso,
+                "is_active": True,
+                "missing_since": None,
+            }
+
+            row["row_hash"] = make_hash(row, [
+                "odoo_id", "name", "state", "is_wave",
+                "user_id", "user_name", "company_id",
+                "picking_type_id", "picking_type_name",
+                "scheduled_date", "date_done", "description",
+                "create_date", "write_date", "is_active", "missing_since",
+            ])
+
+            rows.append(row)
+
+        total_rows += len(rows)
+        affected += sb_rpc_upsert("rpc_upsert_stock_picking_batches", rows,
+                                  batch_size=BATCH_PBATCHES)
+
+    modo = "FULL" if full else "incremental"
+    print(f"✅ PickingBatches {modo}: fetched={total_rows} | db_affected={affected} "
+          f"(desde write_date>{last if not full else 'TODO'})")
+    return total_rows
+
+
 def sync_pickings_incremental(odoo: OdooClient, run_ts_iso: str, chunk: int = 1200, full: bool = False) -> int:
     model = "stock.picking"
     table = TB_PICKINGS
@@ -2814,7 +2891,8 @@ def sync_pickings_incremental(odoo: OdooClient, run_ts_iso: str, chunk: int = 12
         "picking_type_id",
         "location_id", "location_dest_id",
         "group_id",
-        "write_date", "return_id"
+        "write_date", "return_id",
+        "batch_id"
     ]
     pick_fields = available_fields(odoo, model, pick_fields_desired)
     ctx = {"active_test": False}
@@ -2853,6 +2931,7 @@ def sync_pickings_incremental(odoo: OdooClient, run_ts_iso: str, chunk: int = 12
             x_ofp = r.get("x_studio_of_primaria")
             ofp_id, ofp_name = m2o(r.get("x_studio_of_primaria"))
             ret_id, ret_name = m2o(r.get("return_id"))
+            bat_id, bat_name = m2o(r.get("batch_id"))
  
             mod_id = None
             mod_name = None
@@ -2887,6 +2966,8 @@ def sync_pickings_incremental(odoo: OdooClient, run_ts_iso: str, chunk: int = 12
                 "is_active": True,
                 "missing_since": None,
                 "return_id": ret_id,
+                "batch_id": bat_id,
+                "batch_name": bat_name,
             }
  
             row["row_hash"] = make_hash(row, [
@@ -2896,7 +2977,8 @@ def sync_pickings_incremental(odoo: OdooClient, run_ts_iso: str, chunk: int = 12
                 "location_id", "location_name", "location_dest_id", "location_dest_name",
                 "group_id", "x_studio_modulo_id", "x_studio_modulo_name",
                 "x_studio_of_primaria", "x_studio_of_primaria_id", "x_studio_of_primaria_name",
-                "write_date", "is_active", "missing_since", "return_id"
+                "write_date", "is_active", "missing_since", "return_id",
+                "batch_id", "batch_name"
             ])
  
             rows.append(row)
@@ -3115,6 +3197,7 @@ def full_resync_stock_tables(odoo: OdooClient, run_ts_iso: str, soft_delete_days
     print(f"🔄 FULL resync stock (pickings/moves/move_lines) | run_ts={run_ts_iso} | days={days}")
  
     fetched = {
+        "stock_picking_batches": sync_picking_batches_incremental(odoo, run_ts_iso, chunk=500, full=True),
         "stock_pickings":   sync_pickings_incremental(odoo, run_ts_iso, chunk=1200, full=True),
         "stock_moves":      sync_moves_incremental(odoo, run_ts_iso, chunk=1500, full=True),
         "stock_move_lines": sync_move_lines_incremental(odoo, run_ts_iso, chunk=1500, full=True),
@@ -4368,6 +4451,12 @@ def main():
         backfill_missing_child_boms(odoo, limit_ids=5000, max_rounds=10)
     except Exception as e:
         print(f"⚠️ backfill child BOMs: {e}")
+
+    # Batches de pickings (liviano; va antes para que batch_id ya tenga su fila)
+    try:
+        sync_picking_batches_incremental(odoo, run_ts_iso, chunk=500)
+    except Exception as e:
+        print(f"⚠️ picking_batches incremental: {e}")
 
     # Pesadas incremental + hash + RPC
     try:
