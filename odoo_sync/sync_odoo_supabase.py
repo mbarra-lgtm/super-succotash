@@ -2036,6 +2036,10 @@ def sync_crm_projects_incremental(odoo: OdooClient, chunk: int = 800) -> int:
         # ── Cotización / UET ──
         "x_studio_fecha_envio_cotizacion",
         "x_studio_uet",
+
+        # ── Entrega / liberación ──
+        "x_studio_fecha_entregado",
+        "x_studio_fecha_liberacion",
     ]
     fields = available_fields(odoo, model, desired)
  
@@ -2135,6 +2139,10 @@ def sync_crm_projects_incremental(odoo: OdooClient, chunk: int = 800) -> int:
                 # ── Cotización / UET ──
                 "x_studio_fecha_envio_cotizacion": parse_odoo_date(r.get("x_studio_fecha_envio_cotizacion")),
                 "x_studio_uet":                    r.get("x_studio_uet") or None,
+
+                # ── Entrega / liberación ──
+                "x_studio_fecha_entregado":  parse_odoo_date(r.get("x_studio_fecha_entregado")),
+                "x_studio_fecha_liberacion": parse_odoo_date(r.get("x_studio_fecha_liberacion")),
             })
  
         sb_upsert_basic(table, rows, on_conflict="odoo_id", batch_size=1000)
