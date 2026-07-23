@@ -3255,6 +3255,7 @@ def sync_purchase_orders_incremental(odoo: OdooClient, chunk: int = 800, full: b
         "payment_term_id",
         "x_studio_estado_de_pago",
         "x_studio_fecha_de_pago_esperada",
+        "x_studio_credito",
         # Ruta de aprobación
         "use_approval_route", "is_under_approval",
         "is_fully_approved", "is_approval_received",
@@ -3311,6 +3312,7 @@ def sync_purchase_orders_incremental(odoo: OdooClient, chunk: int = 800, full: b
                 "invoice_status": r.get("invoice_status") or None,
                 "receipt_status": r.get("receipt_status") or None,
                 "x_studio_estado_de_pago": r.get("x_studio_estado_de_pago") or None,
+                "x_studio_credito": bool(r.get("x_studio_credito")),
 
                 # Comercial / contable
                 "currency_id": currency_id,
