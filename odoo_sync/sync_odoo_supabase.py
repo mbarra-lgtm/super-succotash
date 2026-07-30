@@ -84,6 +84,7 @@ TB_SALES      = "sales_notes"
 TB_MO         = "manufacturing_orders"
 TB_BOM        = "mrp_boms"
 TB_BOM_LINES  = "mrp_bom_lines"
+TB_ECO        = "mrp_ecos"
 TB_PICKINGS   = "stock_pickings"
 TB_PICKING_BATCHES = "stock_picking_batches"
 TB_MOVES      = "stock_moves"
@@ -4341,6 +4342,105 @@ def sync_bom_lines_only(odoo: OdooClient, bom_ids: List[int], chunk_ids: int = 3
     return len(line_rows)
 
 
+# =========================
+# Incremental: mrp.eco (Engineering Change Orders)
+# =========================
+def sync_mrp_ecos_incremental(odoo: OdooClient, chunk: int = 500,
+                              full: bool = False, run_ts_iso: Optional[str] = None) -> int:
+    """
+    Sincroniza mrp.eco -> mrp_ecos.
+
+    El vinculo con el proyecto es bom_id -> mrp_boms.code = nombre de la NV
+    (las BOM de proyecto se nombran 'S00895'), asi que corre DESPUES de
+    sync_all_boms_incremental.
+
+    Guarda ademas el registro completo en la columna `raw`: la ECO tiene campos
+    studio y asi no se pierde nada si manana queremos uno mas sin migrar esquema
+    ni hacer backfill.
+
+    full=True -> trae TODO lo vivo (sin filtro write_date) y estampa last_seen_at
+    para reconciliar bajas (unlink) en Odoo.
+    """
+    model = "mrp.eco"
+    table = TB_ECO
+
+    desired = [
+        "id", "name", "state", "stage_id", "type_id",
+        "product_tmpl_id", "bom_id", "new_bom_id",
+        "user_id", "effectivity", "effectivity_date",
+        "approved", "allow_apply_change", "priority", "note",
+        "active", "company_id", "create_date", "write_date",
+    ]
+    try:
+        fields = available_fields(odoo, model, desired)
+    except Exception as e:
+        print(f"⚠️ mrp.eco no disponible (¿modulo mrp_plm no instalado?): {e}")
+        return 0
+    if "id" not in fields:
+        print("⚠️ mrp.eco sin campos disponibles; se omite")
+        return 0
+
+    last = sb_get_max_write_date(table)
+    domain: list = []
+    if last and not full:
+        domain.append(["write_date", ">", last])
+
+    total = 0
+    ctx = {"active_test": False}  # incluir ECOs archivadas, igual que en BOMs
+
+    for batch in iter_search_read_all(odoo, model, domain, fields, chunk=chunk, context=ctx):
+        rows: List[dict] = []
+        for r in batch:
+            stage_id, stage_name             = m2o(r.get("stage_id"))
+            type_id, type_name               = m2o(r.get("type_id"))
+            product_tmpl_id, product_tmpl_nm = m2o(r.get("product_tmpl_id"))
+            bom_id, bom_name                 = m2o(r.get("bom_id"))
+            new_bom_id, new_bom_name         = m2o(r.get("new_bom_id"))
+            user_id, user_name               = m2o(r.get("user_id"))
+            company_id, company_name         = m2o(r.get("company_id"))
+
+            row = {
+                "odoo_id": int(r["id"]),
+                "name": r.get("name"),
+                "state": r.get("state"),
+                "stage_id": stage_id,
+                "stage_name": stage_name,
+                "type_id": type_id,
+                "type_name": type_name,
+                "product_tmpl_id": product_tmpl_id,
+                "product_tmpl_name": product_tmpl_nm,
+                "bom_id": bom_id,
+                "bom_name": bom_name,
+                "new_bom_id": new_bom_id,
+                "new_bom_name": new_bom_name,
+                "user_id": user_id,
+                "user_name": user_name,
+                "effectivity": r.get("effectivity"),
+                "effectivity_date": parse_odoo_dt(r.get("effectivity_date")),
+                "approved": r.get("approved"),
+                "allow_apply_change": r.get("allow_apply_change"),
+                "priority": r.get("priority"),
+                "note": r.get("note"),
+                "active": r.get("active"),
+                "company_id": company_id,
+                "company_name": company_name,
+                "create_date": parse_odoo_dt(r.get("create_date")),
+                "write_date": parse_odoo_dt(r.get("write_date")),
+                "raw": r,
+            }
+            if full and run_ts_iso:
+                row["last_seen_at"] = run_ts_iso
+                row["is_active"] = True
+                row["missing_since"] = None
+            rows.append(row)
+
+        sb_upsert_basic(TB_ECO, rows, on_conflict="odoo_id", batch_size=1000)
+        total += len(rows)
+
+    print(f"✅ mrp_ecos {'FULL' if full else 'incremental'}: {total} filas (desde write_date>{last if not full else 'ALL'})")
+    return total
+
+
 def full_resync_mrp_tables(odoo: OdooClient, run_ts_iso: str) -> dict:
     """
     FULL resync de mrp_boms / mrp_bom_lines / manufacturing_orders + reconciliación
@@ -4461,6 +4561,13 @@ def main():
         backfill_missing_child_boms(odoo, limit_ids=5000, max_rounds=10)
     except Exception as e:
         print(f"⚠️ backfill child BOMs: {e}")
+
+    # ECOs (mrp.eco): vinculo al proyecto via bom_id -> mrp_boms.code = nombre NV.
+    # Va despues de los BOMs porque los referencia.
+    try:
+        sync_mrp_ecos_incremental(odoo, chunk=500)
+    except Exception as e:
+        print(f"⚠️ mrp_ecos incremental: {e}")
 
     # Batches de pickings (liviano; va antes para que batch_id ya tenga su fila)
     try:
@@ -4641,6 +4748,7 @@ def main():
                 ("sale.order.line",     "sale_order_lines"),
                 ("sale.order",          "sales_notes"),
                 ("crm.lead",            "crm_projects"),
+                ("mrp.eco",             "mrp_ecos"),
             ]:
                 reconcile_deletions(odoo, _model, _table, run_ts_iso)
             with open(sentinel_mrp, "w") as f:
