@@ -5,6 +5,16 @@ Actualiza el estado de licitaciones vinculadas al CRM Odoo.
 Programar: cada 30 minutos (o 1 vez al día si prefieres).
 
 Lee mp_tender_code de crm_projects y sincroniza el estado actual desde MP.
+
+Escribe en DOS lados:
+  · crm_mp_licitaciones / crm_mp_items / crm_mp_adjudicaciones
+    → vista enriquecida con el vínculo al lead de Odoo.
+  · mp_licitaciones / mp_licitacion_fechas
+    → espejo canónico que lee v_daily_comercial (y el resto de los paneles).
+
+Sin el segundo upsert, una licitación que el barrido de sync_activas.py todavía
+no alcanzó queda invisible para el Daily Comercial aunque este script sí la haya
+traído: el dato existe, pero en una tabla que la vista no mira.
 """
 
 import os, time, json, hashlib, logging, requests, random
@@ -36,6 +46,14 @@ T_LIC   = "crm_mp_licitaciones"
 T_ITEMS = "crm_mp_items"
 T_ADJ   = "crm_mp_adjudicaciones"
 
+# Espejo canónico (mismas tablas que escribe sync_activas.py)
+T_MP_LIC    = "mp_licitaciones"
+T_MP_FECHAS = "mp_licitacion_fechas"
+
+# PostgREST corta las respuestas en 1000 filas por defecto, así que los lotes se
+# piden paginados: con `limit` a secas se perdían las oportunidades del final.
+PAGE = 1000
+
 _session = requests.Session()
 _session.headers.update({"Accept": "application/json"})
 
@@ -58,6 +76,57 @@ def _sb_get(table, filters={}, select="*", limit=5000):
     params.update({"select": select, "limit": str(limit)})
     r = requests.get(f"{SB_REST}/{table}", headers=_sb_headers(), params=params, timeout=30)
     return r.json() if r.ok else []
+
+def _sb_get_paginado(table, select, params=None, page=PAGE, tope=20000):
+    """GET a PostgREST paginado por offset. Devuelve todas las filas."""
+    filas, offset = [], 0
+    while offset < tope:
+        q = dict(params or {})
+        q.update({"select": select, "limit": str(page), "offset": str(offset)})
+        r = requests.get(f"{SB_REST}/{table}", headers=_sb_headers(), params=q, timeout=60)
+        if not r.ok:
+            log.error("SB %s: %s", table, r.text[:200])
+            break
+        lote = r.json() or []
+        filas.extend(lote)
+        if len(lote) < page:
+            break
+        offset += page
+    return filas
+
+
+def _leer_candidatos_crm():
+    """
+    Oportunidades vivas del CRM que tienen código de licitación.
+
+    Antes esto era un `select ... limit=CRM_LIMIT` sin filtro ni orden sobre
+    crm_projects (3.400+ filas), y PostgREST devolvía como máximo 1.000: las
+    oportunidades que caían más allá de esa ventana nunca se consultaban a
+    Mercado Público. Filtrando por código + activas quedan ~200 filas, entra
+    todo con margen y además no se gasta cuota de API en leads muertos.
+    """
+    filas = _sb_get_paginado(
+        T_PROJ,
+        select="odoo_id,name,mp_tender_code",
+        params={
+            "mp_tender_code": "not.is.null",
+            "is_active": "is.true",
+            "won_status": "in.(pending,won)",
+            "order": "odoo_id.desc",
+        },
+        tope=CRM_LIMIT,
+    )
+    seen, candidatos = set(), []
+    for p in filas:
+        # El CRM guarda "1285325-1-LR26/3" (código + ítem); a Mercado Público se
+        # le pregunta solo por el código, igual que hace v_daily_comercial.
+        code = str(p.get("mp_tender_code") or "").strip().split("/")[0].strip()
+        if not code or code in seen:
+            continue
+        seen.add(code)
+        candidatos.append({"codigo": code, "odoo_id": p.get("odoo_id"), "name": p.get("name")})
+    return candidatos
+
 
 def _sb_upsert(table, on_conflict, rows):
     if not rows: return
@@ -93,22 +162,54 @@ def _should_skip(codigo):
     if str(row.get("estado") or "").strip().lower() not in ESTADOS_FINALES: return False
     if not row.get("raw_hash"): return False
     items = _sb_get(T_ITEMS, {"codigo_externo": codigo}, "item_no", 1)
-    return bool(items)
+    if not items: return False
+    # Aunque la licitación esté en estado final, si todavía no llegó al espejo
+    # canónico hay que traerla: es la tabla que lee v_daily_comercial.
+    if not _sb_get(T_MP_LIC, {"codigo_externo": codigo}, "codigo_externo", 1):
+        return False
+    return True
+
+def _upsert_espejo_canonico(codigo, lic, raw_h):
+    """
+    Réplica del cabezal que escribe sync_activas.py en mp_licitaciones, con el
+    payload completo en `raw`: de ahí salen FechaFinal (fin de preguntas) y
+    FechaPubRespuestas, que v_daily_comercial lee del JSON y que la tabla
+    crm_mp_licitaciones no guarda.
+    """
+    fechas = lic.get("Fechas") or {}
+    cab = {
+        "codigo_externo":     codigo,
+        "nombre":             lic.get("Nombre"),
+        "descripcion":        lic.get("Descripcion"),
+        "tipo":               lic.get("Tipo"),
+        "estado":             lic.get("Estado"),
+        "codigo_estado":      lic.get("CodigoEstado"),
+        "moneda":             lic.get("Moneda"),
+        "raw":                lic,   # monto_estimado es columna generada desde raw
+        "fecha_publicacion":  _ts(fechas.get("FechaPublicacion")),
+        "fecha_cierre":       _ts(fechas.get("FechaCierre")),
+        "fecha_adjudicacion": _ts(fechas.get("FechaAdjudicacion")),
+        "raw_hash":           raw_h,
+        "last_sync_at":       datetime.now(timezone.utc).isoformat(),
+    }
+    fechas_row = {
+        "codigo_externo":         codigo,
+        "fecha_publicacion":      _ts(fechas.get("FechaPublicacion")),
+        "fecha_cierre":           _ts(fechas.get("FechaCierre")),
+        "fecha_adjudicacion":     _ts(fechas.get("FechaAdjudicacion")),
+        "fecha_apertura_tecnica": _ts(fechas.get("FechaActoAperturaTecnica")),
+    }
+    _sb_upsert(T_MP_LIC,    "codigo_externo", [cab])
+    _sb_upsert(T_MP_FECHAS, "codigo_externo", [fechas_row])
+
 
 def main():
     log.info("=== sync_crm ===")
 
-    # Leer candidatos desde CRM
-    proyectos = _sb_get(T_PROJ, select="odoo_id,name,mp_tender_code", limit=CRM_LIMIT)
-    seen, candidatos = set(), []
-    for p in proyectos:
-        code = str(p.get("mp_tender_code") or "").strip()
-        if code and code not in seen:
-            seen.add(code)
-            candidatos.append({"codigo": code, "odoo_id": p.get("odoo_id"), "name": p.get("name")})
-
+    # Leer candidatos desde CRM (paginado y filtrado)
+    candidatos = _leer_candidatos_crm()
     log.info("%d licitaciones CRM a verificar", len(candidatos))
-    ok = skip = err = 0
+    ok = skip = err = espejo = 0
 
     for cand in candidatos:
         codigo = cand["codigo"]
@@ -131,6 +232,11 @@ def main():
             # Verificar si cambió
             existing = _sb_get(T_LIC, {"codigo_externo": codigo}, "raw_hash", 1)
             if existing and existing[0].get("raw_hash") == raw_h:
+                # Nada cambió en MP, pero puede faltar en el espejo canónico
+                # (por ejemplo si se agregó después de la primera ingesta).
+                if not _sb_get(T_MP_LIC, {"codigo_externo": codigo}, "codigo_externo", 1):
+                    _upsert_espejo_canonico(codigo, lic, raw_h)
+                    espejo += 1
                 ok += 1
                 continue
 
@@ -151,6 +257,10 @@ def main():
                 "last_sync_at":               datetime.now(timezone.utc).isoformat(),
             }
             _sb_upsert(T_LIC, "codigo_externo", [cab])
+
+            # Espejo canónico: es el que lee v_daily_comercial.
+            _upsert_espejo_canonico(codigo, lic, raw_h)
+            espejo += 1
 
             # Items y adjudicaciones
             _sb_delete(T_ITEMS, "codigo_externo", codigo)
@@ -194,7 +304,8 @@ def main():
             log.warning("Error %s: %s", codigo, repr(e))
             err += 1
 
-    log.info("Resultado: ok=%d skip=%d err=%d", ok, skip, err)
+    log.info("Resultado: ok=%d skip=%d err=%d | espejo mp_licitaciones=%d",
+             ok, skip, err, espejo)
 
 if __name__ == "__main__":
     main()
