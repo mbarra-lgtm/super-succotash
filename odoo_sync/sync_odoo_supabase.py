@@ -2010,6 +2010,19 @@ def sync_crm_projects_incremental(odoo: OdooClient, chunk: int = 800) -> int:
         "x_studio_cantidad_de_vehculos",
         "x_studio_fme",
         "x_studio_efme",
+
+        # ── Fechas de licitación cargadas a mano en el CRM ──
+        # Bloque FECHAS LICITACION del formulario de crm.lead. Son el respaldo
+        # cuando la licitación no está en el espejo mp_licitaciones: sin esto
+        # v_daily_comercial no las ve y la fila queda sin fechas.
+        "x_studio_date_field_8lj_1ihj2dm7k",            # Fecha de Publicación (date)
+        "x_studio_fecha_final_de_preguntas",            # datetime (UTC)
+        "x_studio_fecha_de_publicacin_de_respuestas",   # date
+        "x_studio_fecha_de_cierre_1",                   # datetime (UTC)
+        "x_studio_fecha_de_acto_de_apertura_tcnica_1",  # date
+        "x_studio_fecha_de_acto_de_apertura_econmica",  # date
+        "x_studio_fecha_real_de_apertura",              # date
+        "x_studio_fecha_real_de_adjudicacin",           # date
  
         # ── Segmentación (selection) ──
         "x_studio_empresa",
@@ -2111,6 +2124,19 @@ def sync_crm_projects_incremental(odoo: OdooClient, chunk: int = 800) -> int:
                 "x_studio_es_una_licitacin":                 r.get("x_studio_es_una_licitacin"),
                 "x_studio_fme":                              parse_odoo_dt(r.get("x_studio_fme")),
                 "x_studio_efme":                             parse_odoo_dt(r.get("x_studio_efme")),
+
+                # ── Fechas de licitación (CRM) ──
+                # Cierre y fin de preguntas son datetime en Odoo (UTC): van con
+                # parse_odoo_dt. Con parse_odoo_date se perdería la hora del
+                # cierre, que es justo el dato que se mira en la reunión.
+                "x_studio_date_field_8lj_1ihj2dm7k":           parse_odoo_date(r.get("x_studio_date_field_8lj_1ihj2dm7k")),
+                "x_studio_fecha_final_de_preguntas":           parse_odoo_dt(r.get("x_studio_fecha_final_de_preguntas")),
+                "x_studio_fecha_de_publicacin_de_respuestas":  parse_odoo_date(r.get("x_studio_fecha_de_publicacin_de_respuestas")),
+                "x_studio_fecha_de_cierre_1":                  parse_odoo_dt(r.get("x_studio_fecha_de_cierre_1")),
+                "x_studio_fecha_de_acto_de_apertura_tcnica_1": parse_odoo_date(r.get("x_studio_fecha_de_acto_de_apertura_tcnica_1")),
+                "x_studio_fecha_de_acto_de_apertura_econmica": parse_odoo_date(r.get("x_studio_fecha_de_acto_de_apertura_econmica")),
+                "x_studio_fecha_real_de_apertura":             parse_odoo_date(r.get("x_studio_fecha_real_de_apertura")),
+                "x_studio_fecha_real_de_adjudicacin":          parse_odoo_date(r.get("x_studio_fecha_real_de_adjudicacin")),
  
                 # ── Segmentación (selection siguen con sv) ──
                 "x_studio_empresa":          sv(r.get("x_studio_empresa")),
@@ -2330,6 +2356,104 @@ def backfill_crm_fme_efme(
             updated += len(rows)
 
     print(f"✅ crm_projects backfill fme/efme: {updated} filas actualizadas (sobre {len(ids)} ids candidatos)")
+    return updated
+
+
+# Fechas de licitación del CRM: nombre del campo en Odoo → tipo con el que se
+# parsea ("dt" = datetime en UTC, "date" = fecha suelta).
+CAMPOS_FECHAS_LICITACION: List[Tuple[str, str]] = [
+    ("x_studio_date_field_8lj_1ihj2dm7k",           "date"),  # Fecha de Publicación
+    ("x_studio_fecha_final_de_preguntas",           "dt"),    # Fecha Final de Preguntas
+    ("x_studio_fecha_de_publicacin_de_respuestas",  "date"),  # Pub. de Respuestas
+    ("x_studio_fecha_de_cierre_1",                  "dt"),    # Fecha de Cierre
+    ("x_studio_fecha_de_acto_de_apertura_tcnica_1", "date"),  # Apertura Técnica
+    ("x_studio_fecha_de_acto_de_apertura_econmica", "date"),  # Apertura Económica
+    ("x_studio_fecha_real_de_apertura",             "date"),  # Apertura real
+    ("x_studio_fecha_real_de_adjudicacin",          "date"),  # Adjudicación real
+]
+
+
+def backfill_crm_fechas_licitacion(
+    odoo: OdooClient,
+    chunk_ids: int = 300,
+    limit_ids: int = 20000,
+    solo_licitaciones: bool = True,
+) -> int:
+    """
+    Backfill de las fechas de licitación del CRM en crm_projects.
+
+    El sync de CRM es incremental por write_date: los leads que nadie tocó
+    después del deploy nunca volverían a leerse y quedarían con las columnas
+    nuevas en NULL para siempre. Esto los rellena.
+
+    - `solo_licitaciones=True` limita a las oportunidades marcadas como
+      licitación en el CRM, que son las únicas que usan ese bloque del
+      formulario. Con False pasa por todas.
+    - Solo trae los leads que aún no tienen Fecha de Cierre en el espejo, así
+      la segunda corrida es casi gratis.
+    """
+    q = (
+        sb.table(TB_CRM)
+          .select("odoo_id")
+          .is_("x_studio_fecha_de_cierre_1", "null")
+          .eq("is_active", True)
+    )
+    if solo_licitaciones:
+        q = q.eq("x_studio_es_una_licitacin", "Licitación")
+
+    res = q.limit(limit_ids).execute()
+    err = getattr(res, "error", None)
+    if err:
+        raise RuntimeError(f"Supabase error leyendo {TB_CRM} sin fecha de cierre: {err}")
+
+    ids = uniq_ints([
+        int(r["odoo_id"]) for r in (getattr(res, "data", None) or [])
+        if r.get("odoo_id") is not None
+    ])
+    if not ids:
+        print("✅ crm_projects: fechas de licitación al día (backfill no requerido)")
+        return 0
+
+    desired = ["id", "write_date"] + [n for n, _ in CAMPOS_FECHAS_LICITACION]
+    fields = available_fields(odoo, "crm.lead", desired)
+
+    ausentes = [n for n, _ in CAMPOS_FECHAS_LICITACION if n not in fields]
+    if ausentes:
+        print(f"⚠️  campos de fecha ausentes en Odoo (se ignoran): {', '.join(ausentes)}")
+
+    updated = 0
+    for part in chunked(ids, chunk_ids):
+        batch = odoo.search_read(
+            "crm.lead",
+            [["id", "in", part]],
+            fields,
+            limit=100000,
+            offset=0,
+            order="id asc",
+            context={"active_test": False},
+        ) or []
+
+        rows: List[dict] = []
+        for r in batch:
+            fila: dict = {
+                "odoo_id": int(r["id"]),
+                "write_date": parse_odoo_dt(r.get("write_date")),
+            }
+            for nombre, tipo in CAMPOS_FECHAS_LICITACION:
+                if nombre not in fields:
+                    continue
+                fila[nombre] = (
+                    parse_odoo_dt(r.get(nombre)) if tipo == "dt"
+                    else parse_odoo_date(r.get(nombre))
+                )
+            rows.append(fila)
+
+        if rows:
+            sb_upsert_basic(TB_CRM, rows, on_conflict="odoo_id", batch_size=1000)
+            updated += len(rows)
+            print(f"  ↳ chunk: {len(rows)} filas (acumulado {updated}/{len(ids)})")
+
+    print(f"✅ crm_projects backfill fechas licitación: {updated} filas (sobre {len(ids)} candidatos)")
     return updated
 
 
@@ -4521,6 +4645,7 @@ def main():
         sync_crm_projects_incremental(odoo, chunk=800)
         backfill_crm_fme_efme(odoo, chunk_ids=300, limit_ids=20000)
         backfill_crm_nuevos_campos(odoo, chunk_ids=300, limit_ids=50_000)
+        backfill_crm_fechas_licitacion(odoo, chunk_ids=300, limit_ids=20000)
     except Exception as e:
         print(f"⚠️ crm_projects: {e}")
 
