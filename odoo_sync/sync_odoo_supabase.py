@@ -4904,9 +4904,14 @@ def main():
         backfill_crm_nuevos_campos(odoo, chunk_ids=300, limit_ids=50_000)
         backfill_crm_fechas_licitacion(odoo, chunk_ids=300, limit_ids=20000)
         # Campos agregados 13-ago-2026 (cierre/pérdida, garantías, comerciales,
-        # embudo, multas). Idempotente y barato: 3.461 leads en ~7 lotes.
-        # Se puede comentar una vez que el espejo esté al día.
-        backfill_crm_cierre_y_garantias(odoo, chunk=500)
+        # embudo, multas). Recorre las 3.461 oportunidades completas, así que
+        # NO tiene sentido cada 20 min: queda solo en el full diario.
+        #   job de 20 min  -> SKIP_FULL_RESYNC=1  -> se salta
+        #   full diario    -> FORCE_FULL_RESYNC=1 -> corre
+        # Vale como red de seguridad: el incremental por write_date no detecta
+        # campos nuevos ni correcciones hechas del lado de Supabase.
+        if FORCE_FULL_RESYNC or not SKIP_FULL_RESYNC:
+            backfill_crm_cierre_y_garantias(odoo, chunk=500)
     except Exception as e:
         print(f"⚠️ crm_projects: {e}")
 
