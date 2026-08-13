@@ -2255,11 +2255,16 @@ def sync_crm_projects_incremental(odoo: OdooClient, chunk: int = 800) -> int:
                 # lost_reason_id es many2one: va con m2o(), NO con sv().
                 # odoo_active es el active DE ODOO. NO tocar is_active, que es
                 # la marca de soft-delete del espejo (missing_since/last_seen_at).
+                #
+                # ⚠️ NO usar parse_odoo_bool() aquí: convierte False -> None
+                # (criterio "checkbox sin marcar = null", que sirve para los
+                # x_studio_*). Para 'active' es fatal: active=False ES el dato
+                # que marca la oportunidad perdida, y quedaba NULL.
                 "date_closed":      parse_odoo_dt(r.get("date_closed")),
                 "lost_reason_id":   lost_id,
                 "lost_reason_name": lost_name,
                 "probability":      r.get("probability"),
-                "odoo_active":      parse_odoo_bool(r.get("active")),
+                "odoo_active":      (None if r.get("active") is None else bool(r.get("active"))),
 
                 # ── Garantías / fiel cumplimiento ──
                 "x_studio_garanta_de_seriedad":           r.get("x_studio_garanta_de_seriedad"),
@@ -2372,11 +2377,14 @@ def backfill_crm_cierre_y_garantias(odoo: OdooClient, chunk: int = 500) -> int:
                 "write_date":       parse_odoo_dt(r.get("write_date")),
 
                 # cierre / pérdida
+                # ⚠️ 'active' va con bool() directo, NO con parse_odoo_bool():
+                # ese helper mapea False -> None y perderíamos justo la señal
+                # de "perdida" (active=False).
                 "date_closed":      parse_odoo_dt(r.get("date_closed")),
                 "lost_reason_id":   lost_id,
                 "lost_reason_name": lost_name,
                 "probability":      r.get("probability"),
-                "odoo_active":      parse_odoo_bool(r.get("active")),
+                "odoo_active":      (None if r.get("active") is None else bool(r.get("active"))),
 
                 # garantías / fiel cumplimiento
                 "x_studio_garanta_de_seriedad":           r.get("x_studio_garanta_de_seriedad"),
