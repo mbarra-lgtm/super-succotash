@@ -1985,6 +1985,33 @@ def _clean_char(v):
     return s
  
  
+# Cache de nombres para many2many: {modelo: {id: nombre}}.
+# x_studio_estado_de_garanta_3 y x_studio_estado_fiel_cumplimiento_2 apuntan al
+# MISMO modelo (x_estado_de_garantia), asi que un solo cache sirve para ambos.
+_M2M_CACHE: Dict[str, Dict[int, str]] = {}
+
+
+def m2m_names(odoo: "OdooClient", model: str, ids) -> Optional[List[str]]:
+    """[3, 7] -> ['Emitida', 'Vigente'].  False / [] -> None."""
+    if not ids:
+        return None
+    cache = _M2M_CACHE.setdefault(model, {})
+    faltan = [i for i in ids if i not in cache]
+    if faltan:
+        try:
+            recs = odoo.search_read(
+                model, [["id", "in", faltan]], ["display_name"],
+                limit=len(faltan), offset=0, order="id asc",
+            ) or []
+        except Exception as e:
+            print(f"\u26a0\ufe0f m2m_names({model}): {e}")
+            recs = []
+        for rec in recs:
+            cache[int(rec["id"])] = _clean_char(rec.get("display_name"))
+    out = [cache[i] for i in ids if cache.get(i)]
+    return out or None
+
+
 def sync_crm_projects_incremental(odoo: OdooClient, chunk: int = 800) -> int:
     model = "crm.lead"
     table = TB_CRM
@@ -2054,6 +2081,54 @@ def sync_crm_projects_incremental(odoo: OdooClient, chunk: int = 800) -> int:
         # ── Entrega / liberación ──
         "x_studio_fecha_entregado",
         "x_studio_fecha_liberacion",
+
+        # ── Cierre / pérdida ──
+        # Odoo estampa date_closed en write() cuando probability>=100 (ganada)
+        # o active=False (perdida: action_set_lost -> action_archive).
+        # Verificado 13-ago-2026: 1.332 archivadas == 1.332 won_status='lost'.
+        "date_closed",
+        "lost_reason_id",
+        "probability",
+        "active",
+
+        # ── Garantías / fiel cumplimiento ──
+        "x_studio_garanta_de_seriedad",            # monetary  "Garantía de seriedad"
+        "x_studio_porcentaje_garanta_seriedad_1",  # float     sufijo _1, NO _3
+        "x_studio_fiel_cumplimiento",              # monetary
+        "x_studio_porcentaje_fiel_cumplimiento",   # float
+        "x_studio_estado_de_garanta_3",            # m2m x_estado_de_garantia
+        "x_studio_estado_fiel_cumplimiento_2",     # m2m x_estado_de_garantia
+        "x_studio_boleta_fiel_sobre",              # selection
+        "x_studio_fecha_solicitud_garantia",       # datetime
+        "x_studio_fecha_de_vencimiento_emitida",   # date
+        "x_studio_poliza_subida",                  # datetime
+
+        # ── Comerciales de alto uso ──
+        "x_studio_tipo_de_venta",                  # selection  100%
+        "x_studio_producto",                       # selection  95,2%
+        "x_studio_detalle_producto_1",             # m2o        94,2%
+        "x_studio_monetary_field_81c_1ihnrqn6i",   # monetary   79,1% -> col x_studio_presupuesto_bruto
+        "x_studio_presupuesto_unitario",           # monetary   75,7%
+
+        # ── Ciclo de vida / embudo ──
+        "date_last_stage_update",                  # datetime   100%
+        "date_open",                               # datetime   99,4%
+        "day_open",
+        "day_close",
+        "team_id",                                 # m2o crm.team 99,5%
+        "automated_probability",                   # float      76,9%
+        "x_studio_caducada",                       # boolean    70,2%
+        "tag_ids",                                 # m2m crm.tag ("Estado BTI") 46,5%
+
+        # ── Multas y plazos de licitación ──
+        "x_studio_tipo_multa",
+        "x_studio_valor_multa",
+        "x_studio_multa_diaria",
+        "x_studio_multa_sobre",
+        "x_studio_total_multa_en_",
+        "x_studio_plazo_ofertado_en_dias",
+        "x_studio_selection_field_435_1impo93op",  # "Tipo Días" -> col x_studio_tipo_dias
+        "x_studio_condicin_termino_anticipado",
     ]
     fields = available_fields(odoo, model, desired)
  
@@ -2083,7 +2158,12 @@ def sync_crm_projects_incremental(odoo: OdooClient, chunk: int = 800) -> int:
             subcanal_id, subcanal_name = m2o(r.get("x_studio_subcanal"))
             chasis_id, chasis_name = m2o(r.get("x_studio_chasis_ofertado"))
             jefe_id, jefe_name = m2o(r.get("x_studio_many2one_field_6v0_1ihnr0rrc"))
- 
+
+            # many2one nuevos (13-ago-2026)
+            lost_id, lost_name = m2o(r.get("lost_reason_id"))
+            team_id_, team_name_ = m2o(r.get("team_id"))
+            _, detalle_prod_name = m2o(r.get("x_studio_detalle_producto_1"))
+
             full_name = (r.get("name") or "").strip()
             identificacion = full_name.split(" ", 1)[0].strip() or None
             mp_code, mp_item_no = parse_mp_from_name(full_name)
@@ -2170,12 +2250,181 @@ def sync_crm_projects_incremental(odoo: OdooClient, chunk: int = 800) -> int:
                 # ── Entrega / liberación ──
                 "x_studio_fecha_entregado":  parse_odoo_date(r.get("x_studio_fecha_entregado")),
                 "x_studio_fecha_liberacion": parse_odoo_date(r.get("x_studio_fecha_liberacion")),
+
+                # ── Cierre / pérdida ──
+                # lost_reason_id es many2one: va con m2o(), NO con sv().
+                # odoo_active es el active DE ODOO. NO tocar is_active, que es
+                # la marca de soft-delete del espejo (missing_since/last_seen_at).
+                "date_closed":      parse_odoo_dt(r.get("date_closed")),
+                "lost_reason_id":   lost_id,
+                "lost_reason_name": lost_name,
+                "probability":      r.get("probability"),
+                "odoo_active":      parse_odoo_bool(r.get("active")),
+
+                # ── Garantías / fiel cumplimiento ──
+                "x_studio_garanta_de_seriedad":           r.get("x_studio_garanta_de_seriedad"),
+                "x_studio_porcentaje_garanta_seriedad_1": r.get("x_studio_porcentaje_garanta_seriedad_1"),
+                "x_studio_fiel_cumplimiento":             r.get("x_studio_fiel_cumplimiento"),
+                "x_studio_porcentaje_fiel_cumplimiento":  r.get("x_studio_porcentaje_fiel_cumplimiento"),
+                "x_studio_estado_de_garanta_3":           m2m_names(odoo, "x_estado_de_garantia", r.get("x_studio_estado_de_garanta_3")),
+                "x_studio_estado_fiel_cumplimiento_2":    m2m_names(odoo, "x_estado_de_garantia", r.get("x_studio_estado_fiel_cumplimiento_2")),
+                "x_studio_boleta_fiel_sobre":             sv(r.get("x_studio_boleta_fiel_sobre")),
+                "x_studio_fecha_solicitud_garantia":      parse_odoo_dt(r.get("x_studio_fecha_solicitud_garantia")),
+                "x_studio_fecha_de_vencimiento_emitida":  parse_odoo_date(r.get("x_studio_fecha_de_vencimiento_emitida")),
+                "x_studio_poliza_subida":                 parse_odoo_dt(r.get("x_studio_poliza_subida")),
+
+                # ── Comerciales ──
+                # ⚠️ ALIAS: la columna del espejo NO se llama igual que el campo
+                # de Odoo (Studio le puso nombre mutilado).
+                "x_studio_tipo_de_venta":        sv(r.get("x_studio_tipo_de_venta")),
+                "x_studio_producto":             sv(r.get("x_studio_producto")),
+                "x_studio_detalle_producto_1":   detalle_prod_name,
+                "x_studio_presupuesto_bruto":    r.get("x_studio_monetary_field_81c_1ihnrqn6i"),  # ALIAS
+                "x_studio_presupuesto_unitario": r.get("x_studio_presupuesto_unitario"),
+
+                # ── Ciclo de vida / embudo ──
+                "date_last_stage_update": parse_odoo_dt(r.get("date_last_stage_update")),
+                "date_open":              parse_odoo_dt(r.get("date_open")),
+                "day_open":               r.get("day_open"),
+                "day_close":              r.get("day_close"),
+                "team_id":                team_id_,
+                "team_name":              team_name_,
+                "automated_probability":  r.get("automated_probability"),
+                "x_studio_caducada":      parse_odoo_bool(r.get("x_studio_caducada")),
+                "tag_names":              m2m_names(odoo, "crm.tag", r.get("tag_ids")),
+
+                # ── Multas y plazos ──
+                "x_studio_tipo_multa":                  sv(r.get("x_studio_tipo_multa")),
+                "x_studio_valor_multa":                 r.get("x_studio_valor_multa"),
+                "x_studio_multa_diaria":                parse_odoo_bool(r.get("x_studio_multa_diaria")),
+                "x_studio_multa_sobre":                 sv(r.get("x_studio_multa_sobre")),
+                "x_studio_total_multa_en_":             r.get("x_studio_total_multa_en_"),
+                "x_studio_plazo_ofertado_en_dias":      r.get("x_studio_plazo_ofertado_en_dias"),
+                "x_studio_tipo_dias":                   sv(r.get("x_studio_selection_field_435_1impo93op")),  # ALIAS
+                "x_studio_condicin_termino_anticipado": _clean_char(r.get("x_studio_condicin_termino_anticipado")),
             })
  
         sb_upsert_basic(table, rows, on_conflict="odoo_id", batch_size=1000)
         total += len(rows)
  
     print(f"✅ CRM incremental: {total} filas (desde write_date>{last})")
+    return total
+
+
+def backfill_crm_cierre_y_garantias(odoo: OdooClient, chunk: int = 500) -> int:
+    """
+    Backfill ÚNICO de los campos agregados el 13-ago-2026:
+    cierre/pérdida + garantías + comerciales + embudo + multas.
+
+    Por qué hace falta: sync_crm_projects_incremental() avanza por
+    write_date > last, así que las columnas nuevas SOLO se llenan en las
+    oportunidades que alguien edite. Esto recorre las 3.461 de una pasada.
+
+    Correr una vez; después el incremental las mantiene al día.
+    Idempotente: se puede repetir sin daño.
+    """
+    model = "crm.lead"
+
+    desired = [
+        "id", "write_date",
+        # cierre / pérdida
+        "date_closed", "lost_reason_id", "probability", "active",
+        # garantías / fiel cumplimiento
+        "x_studio_garanta_de_seriedad", "x_studio_porcentaje_garanta_seriedad_1",
+        "x_studio_fiel_cumplimiento", "x_studio_porcentaje_fiel_cumplimiento",
+        "x_studio_estado_de_garanta_3", "x_studio_estado_fiel_cumplimiento_2",
+        "x_studio_boleta_fiel_sobre", "x_studio_fecha_solicitud_garantia",
+        "x_studio_fecha_de_vencimiento_emitida", "x_studio_poliza_subida",
+        # comerciales
+        "x_studio_tipo_de_venta", "x_studio_producto", "x_studio_detalle_producto_1",
+        "x_studio_monetary_field_81c_1ihnrqn6i", "x_studio_presupuesto_unitario",
+        # ciclo de vida / embudo
+        "date_last_stage_update", "date_open", "day_open", "day_close",
+        "team_id", "automated_probability", "x_studio_caducada", "tag_ids",
+        # multas y plazos
+        "x_studio_tipo_multa", "x_studio_valor_multa", "x_studio_multa_diaria",
+        "x_studio_multa_sobre", "x_studio_total_multa_en_",
+        "x_studio_plazo_ofertado_en_dias", "x_studio_selection_field_435_1impo93op",
+        "x_studio_condicin_termino_anticipado",
+    ]
+    fields = available_fields(odoo, model, desired)
+
+    # active_test=False es OBLIGATORIO: las perdidas están archivadas y sin esto
+    # el search_read no las devuelve (justo las 1.332 que nos interesan).
+    ctx = {"active_test": False}
+
+    def sv(v):
+        if v is False or v is None or v == "":
+            return None
+        s = str(v).strip()
+        return s if s else None
+
+    total = 0
+    for batch in iter_search_read_all(odoo, model, [], fields, chunk=chunk, context=ctx):
+        rows: List[dict] = []
+        for r in batch:
+            lost_id, lost_name = m2o(r.get("lost_reason_id"))
+            team_id_, team_name_ = m2o(r.get("team_id"))
+            _, detalle_prod_name = m2o(r.get("x_studio_detalle_producto_1"))
+
+            rows.append({
+                "odoo_id":          int(r["id"]),
+                "write_date":       parse_odoo_dt(r.get("write_date")),
+
+                # cierre / pérdida
+                "date_closed":      parse_odoo_dt(r.get("date_closed")),
+                "lost_reason_id":   lost_id,
+                "lost_reason_name": lost_name,
+                "probability":      r.get("probability"),
+                "odoo_active":      parse_odoo_bool(r.get("active")),
+
+                # garantías / fiel cumplimiento
+                "x_studio_garanta_de_seriedad":           r.get("x_studio_garanta_de_seriedad"),
+                "x_studio_porcentaje_garanta_seriedad_1": r.get("x_studio_porcentaje_garanta_seriedad_1"),
+                "x_studio_fiel_cumplimiento":             r.get("x_studio_fiel_cumplimiento"),
+                "x_studio_porcentaje_fiel_cumplimiento":  r.get("x_studio_porcentaje_fiel_cumplimiento"),
+                "x_studio_estado_de_garanta_3":           m2m_names(odoo, "x_estado_de_garantia", r.get("x_studio_estado_de_garanta_3")),
+                "x_studio_estado_fiel_cumplimiento_2":    m2m_names(odoo, "x_estado_de_garantia", r.get("x_studio_estado_fiel_cumplimiento_2")),
+                "x_studio_boleta_fiel_sobre":             sv(r.get("x_studio_boleta_fiel_sobre")),
+                "x_studio_fecha_solicitud_garantia":      parse_odoo_dt(r.get("x_studio_fecha_solicitud_garantia")),
+                "x_studio_fecha_de_vencimiento_emitida":  parse_odoo_date(r.get("x_studio_fecha_de_vencimiento_emitida")),
+                "x_studio_poliza_subida":                 parse_odoo_dt(r.get("x_studio_poliza_subida")),
+
+                # comerciales (⚠️ ALIAS en presupuesto_bruto)
+                "x_studio_tipo_de_venta":        sv(r.get("x_studio_tipo_de_venta")),
+                "x_studio_producto":             sv(r.get("x_studio_producto")),
+                "x_studio_detalle_producto_1":   detalle_prod_name,
+                "x_studio_presupuesto_bruto":    r.get("x_studio_monetary_field_81c_1ihnrqn6i"),
+                "x_studio_presupuesto_unitario": r.get("x_studio_presupuesto_unitario"),
+
+                # ciclo de vida / embudo
+                "date_last_stage_update": parse_odoo_dt(r.get("date_last_stage_update")),
+                "date_open":              parse_odoo_dt(r.get("date_open")),
+                "day_open":               r.get("day_open"),
+                "day_close":              r.get("day_close"),
+                "team_id":                team_id_,
+                "team_name":              team_name_,
+                "automated_probability":  r.get("automated_probability"),
+                "x_studio_caducada":      parse_odoo_bool(r.get("x_studio_caducada")),
+                "tag_names":              m2m_names(odoo, "crm.tag", r.get("tag_ids")),
+
+                # multas y plazos (⚠️ ALIAS en tipo_dias)
+                "x_studio_tipo_multa":                  sv(r.get("x_studio_tipo_multa")),
+                "x_studio_valor_multa":                 r.get("x_studio_valor_multa"),
+                "x_studio_multa_diaria":                parse_odoo_bool(r.get("x_studio_multa_diaria")),
+                "x_studio_multa_sobre":                 sv(r.get("x_studio_multa_sobre")),
+                "x_studio_total_multa_en_":             r.get("x_studio_total_multa_en_"),
+                "x_studio_plazo_ofertado_en_dias":      r.get("x_studio_plazo_ofertado_en_dias"),
+                "x_studio_tipo_dias":                   sv(r.get("x_studio_selection_field_435_1impo93op")),
+                "x_studio_condicin_termino_anticipado": _clean_char(r.get("x_studio_condicin_termino_anticipado")),
+            })
+
+        if rows:
+            sb_upsert_basic(TB_CRM, rows, on_conflict="odoo_id", batch_size=1000)
+            total += len(rows)
+            print(f"  \u21b3 backfill cierre/garantías: {total} filas")
+
+    print(f"\u2705 crm_projects backfill cierre/garantías: {total} filas")
     return total
 
 
@@ -4646,6 +4895,10 @@ def main():
         backfill_crm_fme_efme(odoo, chunk_ids=300, limit_ids=20000)
         backfill_crm_nuevos_campos(odoo, chunk_ids=300, limit_ids=50_000)
         backfill_crm_fechas_licitacion(odoo, chunk_ids=300, limit_ids=20000)
+        # Campos agregados 13-ago-2026 (cierre/pérdida, garantías, comerciales,
+        # embudo, multas). Idempotente y barato: 3.461 leads en ~7 lotes.
+        # Se puede comentar una vez que el espejo esté al día.
+        backfill_crm_cierre_y_garantias(odoo, chunk=500)
     except Exception as e:
         print(f"⚠️ crm_projects: {e}")
 
