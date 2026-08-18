@@ -156,13 +156,27 @@ def _parse_detalle(lic: dict) -> tuple:
             key = f"{codigo}|{correl}|{rut}"
             if key in seen: continue
             seen.add(key)
+            # La API de MP NO devuelve MontoTotal: entrega MontoUnitario y la
+            # Cantidad adjudicada. Sin este fallback monto_total queda NULL para
+            # siempre (fue la causa de las 367k filas sin monto, ago-2026).
+            # Prioridad de cantidad: la del Adjudicacion (lo realmente adjudicado
+            # a ESTE proveedor) y solo como respaldo la del item de la licitacion.
+            mu   = _num(a.get("MontoUnitario"))
+            cant = _num(a.get("Cantidad"))
+            if cant is None:
+                cant = _num(it.get("Cantidad"))
+            mt = _num(a.get("MontoTotal"))
+            if mt is None and mu is not None and cant is not None:
+                mt = mu * cant
             adj_rows.append({
                 "licitacion_id":    codigo,
                 "item_no":          correl,
                 "proveedor_rut":    rut,
                 "proveedor_nombre": str(a.get("NombreProveedor") or "").strip() or None,
-                "monto_unitario":   _num(a.get("MontoUnitario")),
-                "monto_total":      _num(a.get("MontoTotal")),
+                "cantidad":         cant,
+                "monto_unitario":   mu,
+                "monto_total":      mt,
+                "monto_total_fuente": "api_mu_x_cantidad" if mt is not None else None,
                 "moneda":           str(a.get("Moneda") or lic.get("Moneda") or "").strip() or None,
                 "fecha_resolucion": _ts(a.get("FechaResolucion")),
                 "nro_resolucion":   str(a.get("NroResolucion") or "").strip() or None,

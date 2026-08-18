@@ -32,18 +32,12 @@ logging.basicConfig(level=logging.INFO,
                   "logs", f"backfill_oc_prov_{datetime.now().strftime('%Y%m%d')}.log"), encoding="utf-8")])
 log = logging.getLogger("backfill_oc_prov")
 
-# Grupo Bertonati + competidores (RUTs resueltos desde mp_adjudicaciones)
-RUTS_DEFAULT = [
-    # grupo
-    "87.927.900-3", "77.712.689-K", "76.708.952-K",
-    # competidores
-    "96.877.150-7",  # Peña Spoerer
-    "76.410.092-1",  # Dikar
-    "76.092.123-8",  # L.J. Automotriz
-    "77.428.081-2",  # Mototech
-    "92.475.000-6",  # Kaufmann
-]
-RUTS = [r.strip() for r in (os.getenv("OC_BACKFILL_RUTS") or ",".join(RUTS_DEFAULT)).split(",") if r.strip()]
+# Grupo Bertonati + competidores: se leen de mp_competidores (maestro canonico).
+# OC_BACKFILL_RUTS sigue disponible para forzar una lista puntual.
+from competidores import ruts_objetivo
+
+_env = (os.getenv("OC_BACKFILL_RUTS") or "").strip()
+RUTS = ([r.strip() for r in _env.split(",") if r.strip()] if _env else ruts_objetivo())
 MAX_DET = int(os.getenv("OC_PROV_MAX_DET", "3000"))   # tope de detalles por ejecución
 
 def _ya_con_detalle(codigos):

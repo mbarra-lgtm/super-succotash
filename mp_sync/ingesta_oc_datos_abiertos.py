@@ -41,12 +41,9 @@ MESES  = [m.strip() for m in (os.getenv("OC_DA_MESES") or MESES_DEFAULT).split("
 LOCALZIP = os.getenv("OC_DA_LOCALZIP") or None
 LIMIT    = int(os.getenv("OC_DA_LIMIT", "0"))  # 0 = sin tope
 
-RUTS_TARGET = {
-    "87.927.900-3", "77.712.689-K", "76.708.952-K",           # grupo
-    "96.877.150-7", "76.410.092-1", "76.092.123-8",           # Peña Spoerer, Dikar, L.J.
-    "77.428.081-2", "92.475.000-6",                           # Mototech, Kaufmann
-}
-RUTS_NORM = {r.replace(".", "").replace("-", "").upper() for r in RUTS_TARGET}
+# RUTs objetivo para la carga de ITEMS: desde mp_competidores, no una lista literal.
+from competidores import ruts_norm
+RUTS_NORM = ruts_norm()
 
 def _norm_rut(v):
     return (v or "").replace(".", "").replace("-", "").strip().upper()

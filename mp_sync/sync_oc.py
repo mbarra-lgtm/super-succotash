@@ -275,5 +275,18 @@ def main():
     log.info("Resultado: %d OC con detalle, %d sin detalle, %d errores | %d quedan para la próxima",
              ok, sin_det, err, restantes)
 
+    # Latido de frescura: sin esto nadie se entera si la ingesta se cae.
+    # El panel de cartera observa data_freshness para decidir hasta que mes
+    # es publicable la serie de bookings.
+    try:
+        _sb_upsert("data_freshness", "dataset", [{
+            "dataset":      "mp_oc",
+            "refreshed_at": datetime.now(timezone.utc).isoformat(),
+            "rows_changed": ok,
+            "source":       "sync_oc.py",
+        }])
+    except Exception as e:
+        log.warning("No pude estampar data_freshness: %s", repr(e))
+
 if __name__ == "__main__":
     main()
