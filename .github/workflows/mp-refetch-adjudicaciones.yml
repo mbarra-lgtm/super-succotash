@@ -1,0 +1,54 @@
+name: MP · Re-fetch adjudicaciones sin monto
+
+# Recupera el monto adjudicado de licitaciones que quedaron sin monto_total por
+# el bug del fallback en backfill_estados_lic.py. Ese backfill no las alcanza:
+# solo toma licitaciones con estado null, y estas ya tienen estado.
+#
+# Arranca en scope=bti (las ~167 del grupo, que desbloquean el análisis de
+# brecha de precio). Cuando eso termine, cambiar a sin_monto y dejar drenar.
+
+on:
+  schedule:
+    - cron: "0 3 * * *"        # 03:00 UTC ≈ 23:00 Chile, fuera de la ventana de Odoo
+  workflow_dispatch:
+    inputs:
+      scope:
+        description: "bti | sin_monto | lista"
+        default: "bti"
+        type: choice
+        options: ["bti", "sin_monto", "lista"]
+      codigos:
+        description: "Códigos separados por coma (solo con scope=lista)"
+        default: ""
+      max:
+        description: "Tope de licitaciones por corrida"
+        default: "400"
+
+concurrency:
+  group: mp-refetch-adj
+  cancel-in-progress: false
+
+jobs:
+  refetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    defaults:
+      run:
+        working-directory: mp_sync
+    env:
+      SUPABASE_URL:         ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+      TICKET_ACTIVAS:       ${{ secrets.TICKET_ACTIVAS }}
+      SLEEP_BETWEEN:        "2.0"
+      REFETCH_SCOPE:        ${{ github.event.inputs.scope || 'bti' }}
+      REFETCH_CODIGOS:      ${{ github.event.inputs.codigos || '' }}
+      REFETCH_MAX:          ${{ github.event.inputs.max || '400' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: mp_sync/requirements.txt
+      - run: pip install -r requirements.txt
+      - run: python refetch_adjudicaciones.py
