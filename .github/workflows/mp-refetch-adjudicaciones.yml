@@ -13,10 +13,10 @@ on:
   workflow_dispatch:
     inputs:
       scope:
-        description: "bti | sin_monto | lista"
+        description: "bti | sin_acta | sin_monto | lista"
         default: "bti"
         type: choice
-        options: ["bti", "sin_monto", "lista"]
+        options: ["bti", "sin_acta", "sin_monto", "lista"]
       codigos:
         description: "Códigos separados por coma (solo con scope=lista)"
         default: ""
@@ -51,4 +51,12 @@ jobs:
           cache: pip
           cache-dependency-path: mp_sync/requirements.txt
       - run: pip install -r requirements.txt
-      - run: python refetch_adjudicaciones.py
+      - name: Re-fetch segun scope
+        run: python refetch_adjudicaciones.py
+      - name: Actas faltantes del grupo (zona ciega)
+        # Solo en la corrida programada: en un dispatch manual manda el scope elegido.
+        if: github.event_name == 'schedule'
+        env:
+          REFETCH_SCOPE: sin_acta
+          REFETCH_MAX: "100"
+        run: python refetch_adjudicaciones.py

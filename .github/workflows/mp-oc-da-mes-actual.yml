@@ -1,0 +1,46 @@
+name: MP · OC Datos Abiertos (mes en curso, diario)
+
+# El archivo mensual del MES EN CURSO ya existe en el blob de ChileCompra y se
+# actualiza a diario. Sin esta corrida, el mes corriente vive solo con lo que
+# alcanza a traer la ingesta por API (~1.300 OC/dia contra ~150.000/mes reales)
+# y cualquier informe emitido antes del dia 22 subestima el volumen.
+# La carga del mes vencido sigue en mp-oc-datos-abiertos.yml (dia 22).
+
+on:
+  schedule:
+    - cron: "0 8 * * *"        # 08:00 UTC ≈ 04:00-05:00 CL, despues de la ingesta por API
+  workflow_dispatch:
+    inputs:
+      meses:
+        description: "Meses a cargar (vacío = mes en curso)"
+        default: ""
+
+concurrency:
+  group: mp-oc-datos-abiertos   # comparte grupo con la carga mensual: nunca en paralelo
+  cancel-in-progress: false
+
+jobs:
+  cargar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    defaults:
+      run:
+        working-directory: mp_sync
+    env:
+      SUPABASE_URL:         ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Resolver mes (input o mes en curso)
+        run: |
+          if [ -n "${{ github.event.inputs.meses }}" ]; then
+            echo "OC_DA_MESES=${{ github.event.inputs.meses }}" >> "$GITHUB_ENV"
+          else
+            echo "OC_DA_MESES=$(date -u +%Y-%-m)" >> "$GITHUB_ENV"
+          fi
+      - run: python ingesta_oc_datos_abiertos.py

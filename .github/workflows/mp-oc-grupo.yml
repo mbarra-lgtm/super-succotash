@@ -1,0 +1,39 @@
+name: MP · OC del grupo por proveedor (cada 6h)
+
+# Separado de mp-oc-backfill-proveedor.yml a proposito: ese barre los 59 RUTs de
+# mp_competidores con un presupuesto compartido y sin orden garantizado, asi que
+# los 3 RUTs del grupo pueden quedar sin cuota detras de la inteligencia
+# competitiva. Nuestras propias OC son dato operativo, no analitica: van aparte,
+# mas seguido y con presupuesto propio.
+
+on:
+  schedule:
+    - cron: "20 */6 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: mp-oc-grupo
+  cancel-in-progress: false
+
+jobs:
+  grupo:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: mp_sync
+    env:
+      SUPABASE_URL:         ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+      TICKET_OC:            ${{ secrets.TICKET_OC }}
+      SLEEP_BETWEEN_OC:     "2.0"
+      OC_PROV_MAX_DET:      "400"
+      OC_BACKFILL_RUTS:     "87.927.900-3,77.712.689-K,76.708.952-K"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - run: python backfill_oc_por_proveedor.py
