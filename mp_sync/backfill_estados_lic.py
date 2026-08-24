@@ -12,7 +12,7 @@ Estimado: ~37k licitaciones × 2s = ~20h total → ~2-3 semanas de noches.
 """
 
 import os, time, json, hashlib, logging, requests
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Optional
 
 try:
@@ -24,6 +24,8 @@ from cursor_store import load_cursor, save_cursor
 
 # La carpeta de logs debe existir ANTES de configurar el FileHandler
 os.makedirs(os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs"), exist_ok=True)
+
+REINTENTO_DIAS = int(os.getenv("REINTENTO_DIAS", "30"))
 
 logging.basicConfig(
     level=logging.INFO,
@@ -119,7 +121,7 @@ def _ts(v) -> Optional[str]:
     except: return None
 
 def _num(v):
-    try: return float(str(v).strip())
+    try: return float(str(v).replace(",", ".").strip())
     except: return None
 
 def _hash(obj) -> str:
@@ -166,8 +168,9 @@ def _parse_detalle(lic: dict) -> tuple:
             if cant is None:
                 cant = _num(it.get("Cantidad"))
             mt = _num(a.get("MontoTotal"))
+            fuente = "api_monto_total" if mt is not None else None
             if mt is None and mu is not None and cant is not None:
-                mt = mu * cant
+                mt, fuente = mu * cant, "api_mu_x_cantidad"
             adj_rows.append({
                 "licitacion_id":    codigo,
                 "item_no":          correl,
@@ -176,7 +179,7 @@ def _parse_detalle(lic: dict) -> tuple:
                 "cantidad":         cant,
                 "monto_unitario":   mu,
                 "monto_total":      mt,
-                "monto_total_fuente": "api_mu_x_cantidad" if mt is not None else None,
+                "monto_total_fuente": fuente,
                 "moneda":           str(a.get("Moneda") or lic.get("Moneda") or "").strip() or None,
                 "fecha_resolucion": _ts(a.get("FechaResolucion")),
                 "nro_resolucion":   str(a.get("NroResolucion") or "").strip() or None,
@@ -185,24 +188,39 @@ def _parse_detalle(lic: dict) -> tuple:
     return estado_row, adj_rows
 
 # ── Fetch pendientes desde Supabase ─────────────────────────────────────────
-def _get_pendientes(offset: int, limit: int) -> list:
+def _get_pendientes(limit: int) -> list:
     """
     Trae licitaciones con estado null y fecha_cierre pasada,
     ordenadas por fecha_cierre ASC (las más antiguas primero).
+
+    SIN offset a proposito: el propio filtro (estado is null) es el cursor, porque
+    las procesadas dejan de calificar. Avanzar un offset sobre un conjunto que se
+    encoge saltaba la mitad del backlog en cada corrida y despues declaraba
+    "backfill completo" siendo falso.
+
+    La ventana sobre last_detail_fetch_at evita que las licitaciones sin detalle en
+    la API (que quedan con estado null) bloqueen para siempre la cabeza del lote,
+    pero SIN vetarlas: una licitacion consultada antes de su adjudicacion tiene que
+    volver a entrar mas adelante (caso 1057862-1-LE26: detalle pedido el 02-02-2026,
+    adjudicada el 01-04-2026). Se reintenta pasados REINTENTO_DIAS.
     """
+    corte = (datetime.now(timezone.utc) - timedelta(days=REINTENTO_DIAS)).isoformat()
     r = requests.get(
         f"{SB_REST}/{T_LIC}", headers=_sb_headers(),
         params={
-            "select":        "codigo_externo,fecha_cierre",
-            "codigo_estado":  "eq.5",
-            "estado":         "is.null",
-            "fecha_cierre":   "lt.now()",
-            "order":          "fecha_cierre.asc",
-            "limit":          str(limit),
-            "offset":         str(offset),
+            "select":               "codigo_externo,fecha_cierre",
+            "codigo_estado":         "eq.5",
+            "estado":                "is.null",
+            "or":                    f"(last_detail_fetch_at.is.null,last_detail_fetch_at.lt.{corte})",
+            "fecha_cierre":          "lt.now()",
+            "order":                 "fecha_cierre.asc",
+            "limit":                 str(limit),
         }, timeout=30
     )
-    return r.json() if r.ok else []
+    if not r.ok:
+        # Un 500 de PostgREST devolvia [] y el main lo leia como "no hay pendientes".
+        raise RuntimeError(f"PostgREST {r.status_code}: {r.text[:200]}")
+    return r.json()
 
 # ── Main ────────────────────────────────────────────────────────────────────
 def main():
@@ -214,7 +232,7 @@ def main():
     log.info("=== backfill_estados_lic === offset=%d | acumulado: ok=%d err=%d",
              state["offset"], state["ok"], state["err"])
 
-    pendientes = _get_pendientes(state["offset"], LOTE_SIZE)
+    pendientes = _get_pendientes(LOTE_SIZE)
     if not pendientes:
         log.info("✅ Backfill completo — no hay más pendientes con estado null.")
         return

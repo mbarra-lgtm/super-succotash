@@ -92,5 +92,18 @@ def main():
 
     log.info("=== Fin: %d OCs con detalle, %d errores | quedan por drenar en próximas corridas ===", tot_ok, tot_err)
 
+    # Latido de frescura: sin esto nadie se entera si el barrido se cae. Es el job
+    # que garantiza las OC del grupo, asi que su silencio tiene que ser detectable.
+    try:
+        from datetime import timezone
+        _sb_upsert("data_freshness", "dataset", [{
+            "dataset":      "mp_oc_proveedor",
+            "refreshed_at": datetime.now(timezone.utc).isoformat(),
+            "rows_changed": tot_ok,
+            "source":       "backfill_oc_por_proveedor.py",
+        }])
+    except Exception as e:
+        log.warning("No pude estampar data_freshness: %s", repr(e))
+
 if __name__ == "__main__":
     main()

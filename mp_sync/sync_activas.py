@@ -114,7 +114,7 @@ def _ts(v) -> Optional[str]:
     except: return None
 
 def _num(v):
-    try: return float(str(v).strip())
+    try: return float(str(v).replace(",", ".").strip())
     except: return None
 
 def _parse(lic: dict):
@@ -206,9 +206,16 @@ def main():
     # 1. Listado de activas
     data    = _mp_get({"estado": "activas"})
     listado = data.get("Listado") or []
-    todos   = list({str(l.get("CodigoExterno") or "").strip()
-                    for l in listado
-                    if str(l.get("CodigoExterno") or "").strip()})
+    # Orden estable: list(set(...)) depende de la aleatorizacion de hash de CPython,
+    # que cambia en cada proceso. El cursor quedaba apuntando a una permutacion que
+    # ya no existe en la corrida siguiente, asi que la ventana no era "las que
+    # faltan" sino una muestra al azar y habia licitaciones nunca visitadas.
+    vistos, todos = set(), []
+    for l in listado:
+        c = str(l.get("CodigoExterno") or "").strip()
+        if c and c not in vistos:
+            vistos.add(c); todos.append(c)
+    todos.sort()
 
     # 2. Cursor
     cursor  = _load_cursor()
@@ -241,11 +248,17 @@ def main():
                 sin_cambio += 1
                 continue
 
+            # El raw_hash es el testigo de "cabecera + hijos escritos", asi que se
+            # estampa al final: si el upsert de items falla, la proxima corrida
+            # reintenta en vez de darla por sincronizada.
+            nuevo_hash = cab.pop("raw_hash")
             _sb_upsert(T_LIC,    "codigo_externo", [cab])
             _sb_upsert(T_COMP,   "codigo_externo", [comp_row])
             _sb_upsert(T_FECHAS, "codigo_externo", [fechas_row])
             if item_rows: _sb_upsert(T_ITEMS, "codigo_externo,correlativo", item_rows)
             if adj_rows:  _sb_upsert(T_ADJ, "licitacion_id,item_no,proveedor_rut", adj_rows)
+            _sb_upsert(T_LIC, "codigo_externo",
+                       [{"codigo_externo": codigo, "raw_hash": nuevo_hash}])
 
             if codigo in hashes: actualizadas += 1
             else:                nuevas += 1
@@ -255,9 +268,9 @@ def main():
             log.warning("Error %s: %s", codigo, repr(e))
             err += 1
 
-    _save_cursor(cursor + MAX_POR_RUN)  # avanza aunque no haya cambios
+    _save_cursor(cursor + len(tramo))  # avanza lo efectivamente recorrido
     log.info("Resultado: %d nuevas, %d actualizadas, %d sin cambio, %d errores | cursor→%d",
-             nuevas, actualizadas, sin_cambio, err, cursor + MAX_POR_RUN)
+             nuevas, actualizadas, sin_cambio, err, cursor + len(tramo))
 
 if __name__ == "__main__":
     main()

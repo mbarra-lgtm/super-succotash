@@ -215,6 +215,7 @@ def main():
     total = 0
     pendientes_detalle = []
     pagina = 1
+    listado_completo = True
 
     while True:
         params["numero_pagina"] = pagina
@@ -223,6 +224,7 @@ def main():
             time.sleep(SLEEP)
         except Exception as e:
             log.error("Error listado página %d: %s", pagina, repr(e))
+            listado_completo = False
             break
 
         pag   = payload["paginacion"]
@@ -247,8 +249,13 @@ def main():
     # enriquecimiento (idempotente) y no debe bloquear el avance del cursor:
     # si falla o es lenta, no queremos reprocesar todo el listado en la próxima
     # corrida (eso causaba runs gigantes de miles de filas).
-    _save_cursor(ahora_cl.strftime("%Y-%m-%dT%H:%M:%S"))
-    log.info("Cursor guardado: %s (hora Chile)", ahora_cl.strftime("%Y-%m-%dT%H:%M:%S"))
+    # ...pero si el LISTADO quedo incompleto no se avanza: esa ventana no vuelve a
+    # consultarse nunca y las compras agiles de las paginas no leidas se perdian.
+    if listado_completo:
+        _save_cursor(ahora_cl.strftime("%Y-%m-%dT%H:%M:%S"))
+        log.info("Cursor guardado: %s (hora Chile)", ahora_cl.strftime("%Y-%m-%dT%H:%M:%S"))
+    else:
+        log.error("Listado incompleto: NO se avanza el cursor; la ventana se reintenta.")
 
     for id_mp in pendientes_detalle:
         try:

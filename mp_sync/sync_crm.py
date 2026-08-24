@@ -152,7 +152,7 @@ def _ts(v):
     except: return None
 
 def _num(v):
-    try: return float(str(v).strip())
+    try: return float(str(v).replace(",", ".").strip())
     except: return None
 
 def _should_skip(codigo):
@@ -189,7 +189,10 @@ def _upsert_espejo_canonico(codigo, lic, raw_h):
         "fecha_publicacion":  _ts(fechas.get("FechaPublicacion")),
         "fecha_cierre":       _ts(fechas.get("FechaCierre")),
         "fecha_adjudicacion": _ts(fechas.get("FechaAdjudicacion")),
-        "raw_hash":           raw_h,
+        # Sin raw_hash: es el testigo que usa sync_activas.py para saber si ya
+        # escribio cabecera + items + comprador. Al estamparlo aca (mismo _hash
+        # sobre el mismo payload) sync_activas veia "sin cambio" y nunca escribia
+        # los hijos de las licitaciones del CRM, justo las que mas importan.
         "last_sync_at":       datetime.now(timezone.utc).isoformat(),
     }
     fechas_row = {

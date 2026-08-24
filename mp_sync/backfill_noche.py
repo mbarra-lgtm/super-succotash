@@ -219,16 +219,32 @@ def backfill_licitaciones():
                             key = f"{codigo}|{correl}|{rut}"
                             if key in seen_a: continue
                             seen_a.add(key)
+                            # La API no devuelve MontoTotal: sin el fallback este
+                            # backfill dejaba en NULL los montos ya reparados.
+                            mu   = _num(a.get("MontoUnitario"))
+                            cant = _num(a.get("Cantidad")) or _num(it.get("Cantidad"))
+                            mt   = _num(a.get("MontoTotal"))
+                            fuente = "api_monto_total" if mt is not None else None
+                            if mt is None and mu is not None and cant is not None:
+                                mt, fuente = mu * cant, "api_mu_x_cantidad"
                             adj_rows.append({
                                 "licitacion_id":   codigo, "item_no": correl,
                                 "proveedor_rut":   rut,
                                 "proveedor_nombre":_str(a.get("NombreProveedor")),
-                                "monto_total":     _num(a.get("MontoTotal")),
+                                "cantidad":        cant,
+                                "monto_unitario":  mu,
+                                "monto_total":     mt,
+                                "monto_total_fuente": fuente,
                             })
-                    _sb_delete("mp_licitacion_items", "codigo_externo", codigo)
-                    _sb_delete("mp_adjudicaciones",   "licitacion_id",  codigo)
-                    if item_rows: _sb_upsert("mp_licitacion_items", "codigo_externo,correlativo", item_rows)
-                    if adj_rows:  _sb_upsert("mp_adjudicaciones", "licitacion_id,item_no,proveedor_rut", adj_rows)
+                    # DELETE solo si hay algo con que reemplazar: si el detalle vino
+                    # sin items (respuesta parcial de la API), el delete incondicional
+                    # borraba filas buenas y no las reponia.
+                    if item_rows:
+                        _sb_delete("mp_licitacion_items", "codigo_externo", codigo)
+                        _sb_upsert("mp_licitacion_items", "codigo_externo,correlativo", item_rows)
+                    if adj_rows:
+                        _sb_delete("mp_adjudicaciones", "licitacion_id", codigo)
+                        _sb_upsert("mp_adjudicaciones", "licitacion_id,item_no,proveedor_rut", adj_rows)
                     total += 1
                 except Exception as e:
                     log.warning("Error lic %s: %s", codigo, repr(e))
@@ -270,10 +286,9 @@ def backfill_compra_agil():
                 "id_orden_compra":   oc.get("id_orden_compra"),
                 "detail_synced_at":  datetime.now(timezone.utc).isoformat(),
             }
-            _sb_upsert("mp_compra_agil", "id_mp", [extra])
-
-            # Proveedores
-            _sb_delete("mp_ca_proveedores_cotizando", id_mp)
+            # Proveedores primero: detail_synced_at se estampa al final, para que
+            # un fallo aca no saque la CA del conjunto pendiente para siempre.
+            _sb_delete("mp_ca_proveedores_cotizando", "id_mp", id_mp)
             pv_rows = []
             for pv in det.get("proveedores_cotizando", []):
                 pv_rows.append({
@@ -283,10 +298,13 @@ def backfill_compra_agil():
                     "id_cotizacion":          pv.get("id_cotizacion"),
                     "valor_neto":             _float(pv.get("valor_neto")),
                     "monto_total":            _float(pv.get("monto_total")),
-                    "proveedor_seleccionado": (pv.get("seleccion") or {}).get("proveedor_seleccionado", False),
+                    # El flag viene al nivel del proveedor, no bajo "seleccion":
+                    # leerlo por la ruta vieja marcaba False a todos.
+                    "proveedor_seleccionado": bool(pv.get("proveedor_seleccionado", 0)),
                 })
             if pv_rows: _sb_upsert("mp_ca_proveedores_cotizando", "id_mp,id_cotizacion", pv_rows)
-            log.info("CA detalle OK: %s", id_mp)
+            _sb_upsert("mp_compra_agil", "id_mp", [extra])
+            log.info("CA detalle OK: %s (%d proveedores)", id_mp, len(pv_rows))
         except Exception as e:
             log.warning("Error CA %s: %s", id_mp, repr(e))
 

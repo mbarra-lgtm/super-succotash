@@ -21,6 +21,15 @@ Selección de objetivos, por prioridad (env `REFETCH_SCOPE`):
   sin_monto  cualquier licitacion con filas en mp_adjudicaciones sin
              monto_unitario. Son ~289k filas -> muchisimas licitaciones;
              usar con REFETCH_MAX y dejar que drene en varias noches.
+  sin_acta   licitaciones del grupo (via crm_projects.mp_tender_code) que YA
+             tienen estado en el espejo pero CERO filas en mp_adjudicaciones.
+             Es la zona ciega entre los dos backfills: backfill_estados_lic.py
+             solo toma licitaciones con estado null y el scope bti solo las que
+             tienen filas sin monto, asi que una licitacion adjudicada cuya acta
+             nunca se ingesto no califica en ninguno de los dos y desaparece de
+             todo reporte de adjudicaciones (caso 5240-207-LR24, adjudicada el
+             05-06-2025). Se limita a estado Adjudicada o Cerrada: Desierta,
+             Revocada y Publicada no tienen acta que traer.
   lista      los codigos de REFETCH_CODIGOS, separados por coma.
 
 Config:
@@ -62,15 +71,39 @@ def _sb_get(path, params):
     return r.json()
 
 
-def _codigos_bti():
-    """Códigos de licitación donde participó el grupo y falta el monto."""
+def _codigos_crm():
+    """Todos los códigos de licitación que el CRM registra para el grupo."""
     rows = _sb_get("crm_projects", {
         "select": "mp_tender_code",
         "mp_tender_code": "not.is.null",
         "is_active": "not.is.false",
         "limit": "5000",
     })
-    codigos = {r["mp_tender_code"].strip() for r in rows if (r.get("mp_tender_code") or "").strip()}
+    return sorted({r["mp_tender_code"].strip() for r in rows if (r.get("mp_tender_code") or "").strip()})
+
+
+def _codigos_de_nuestras_oc():
+    """Licitaciones que aparecen en las OC recibidas por el grupo.
+
+    Hace falta porque el CRM no tiene todas: hay licitaciones de 2024 y comienzos
+    de 2025 que ganamos y de las que solo queda rastro en la orden de compra. La
+    OC es prueba de adjudicacion, asi que su codigo_licitacion es un objetivo
+    legitimo para traer el acta.
+    """
+    ruts = os.getenv("REFETCH_RUTS_GRUPO", "87.927.900-3,77.712.689-K,76.708.952-K")
+    lista = ",".join(f'"{r.strip()}"' for r in ruts.split(",") if r.strip())
+    rows = _sb_get("mp_oc_header", {
+        "select": "codigo_licitacion",
+        "codigo_licitacion": "not.is.null",
+        "proveedor_rut": f"in.({lista})",
+        "limit": "5000",
+    })
+    return sorted({r["codigo_licitacion"].strip() for r in rows if (r.get("codigo_licitacion") or "").strip()})
+
+
+def _codigos_bti():
+    """Códigos de licitación donde participó el grupo y falta el monto."""
+    codigos = set(_codigos_crm())
     if not codigos:
         return []
 
@@ -89,6 +122,62 @@ def _codigos_bti():
         })
         pendientes.update(r["licitacion_id"] for r in rows)
     return sorted(pendientes)
+
+
+def _codigos_sin_acta():
+    """Licitaciones del grupo con estado en el espejo y ninguna fila de acta.
+
+    Dos consultas: primero se descartan las que ya tienen filas en
+    mp_adjudicaciones, y de las que quedan se piden solo las que el espejo marca
+    Adjudicada o Cerrada. "Cerrada" entra a proposito: son licitaciones cuyo
+    estado nunca se refresco despues del cierre y pueden estar adjudicadas sin
+    que el espejo lo sepa; la llamada al detalle actualiza estado y acta de una.
+    """
+    codigos = sorted(set(_codigos_crm()) | set(_codigos_de_nuestras_oc()))
+    if not codigos:
+        return []
+
+    con_acta = set()
+    for i in range(0, len(codigos), 80):
+        chunk = codigos[i:i + 80]
+        lista = ",".join(f'"{c}"' for c in chunk)
+        rows = _sb_get(T_ADJ, {
+            "select": "licitacion_id",
+            "licitacion_id": f"in.({lista})",
+            "limit": "20000",
+        })
+        con_acta.update(r["licitacion_id"] for r in rows)
+
+    faltan = [c for c in codigos if c not in con_acta]
+    if not faltan:
+        return []
+
+    # De las que faltan, entran dos casos:
+    #  a) tienen cabecera y el espejo las marca Adjudicada o Cerrada;
+    #  b) NO tienen cabecera en mp_licitaciones. Pasa con las licitaciones cerradas
+    #     antes de que arrancara sync_activas.py, que solo ve las activas del dia:
+    #     nunca las vio y por eso no hay fila. La API responde por codigo igual, asi
+    #     que se piden lo mismo (es el caso de 2924-35-LP24, 5420-26/27-LR24, etc.).
+    # Quedan fuera Desierta, Revocada y Publicada: no hay acta que traer.
+    con_cabecera, elegibles = set(), []
+    for i in range(0, len(faltan), 80):
+        chunk = faltan[i:i + 80]
+        lista = ",".join(f'"{c}"' for c in chunk)
+        rows = _sb_get(T_LIC, {
+            "select": "codigo_externo,estado",
+            "codigo_externo": f"in.({lista})",
+            "limit": "5000",
+        })
+        for r in rows:
+            con_cabecera.add(r["codigo_externo"])
+            if (r.get("estado") or "") in ("Adjudicada", "Cerrada"):
+                elegibles.append(r["codigo_externo"])
+    sin_cabecera = [c for c in faltan if c not in con_cabecera]
+    out = sorted(set(elegibles) | set(sin_cabecera))
+    log.info("sin_acta: %d códigos (CRM + OC del grupo), %d con acta, "
+             "%d objetivos (%d con cabecera adjudicada/cerrada, %d sin cabecera)",
+             len(codigos), len(con_acta), len(out), len(elegibles), len(sin_cabecera))
+    return out
 
 
 def _codigos_sin_monto():
@@ -115,6 +204,8 @@ def objetivos():
         return _codigos_sin_monto()
     if SCOPE == "bti":
         return _codigos_bti()
+    if SCOPE == "sin_acta":
+        return _codigos_sin_acta()
     log.error("REFETCH_SCOPE desconocido: %r", SCOPE)
     sys.exit(2)
 

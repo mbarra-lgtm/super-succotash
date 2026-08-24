@@ -6,6 +6,9 @@ Carga masiva de Órdenes de Compra desde Datos Abiertos de ChileCompra
 
 Archivos mensuales (blob Azure público, ~90 MB zip, CSV ';' una fila por ítem):
   https://transparenciachc.blob.core.windows.net/oc-da/{AÑO}-{MES}.zip  (mes sin cero)
+  El archivo del MES EN CURSO existe y ChileCompra lo actualiza a diario: se puede
+  cargar sin esperar al cierre de mes.
+  El CSV viene en CP1252, no en UTF-8: leerlo como utf-8 corrompe todos los acentos.
 
 Estrategia acordada:
   - HEADERS: se cargan TODAS las OCs del mes (match OC↔licitación de todo el mercado).
@@ -163,7 +166,7 @@ def procesar_mes(mes: str, zip_path: str):
     n_rows = n_h = n_i = 0
 
     with z.open(name) as f:
-        reader = csv.DictReader(io.TextIOWrapper(f, encoding="utf-8", errors="replace"), delimiter=";")
+        reader = csv.DictReader(io.TextIOWrapper(f, encoding="cp1252", errors="replace"), delimiter=";")
         for r in reader:
             n_rows += 1
             if LIMIT and n_rows > LIMIT: break

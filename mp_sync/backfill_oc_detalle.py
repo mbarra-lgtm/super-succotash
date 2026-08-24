@@ -13,7 +13,7 @@ Estimado: ~277k OC × ~2s = ~150h → repartir en varias noches.
 """
 
 import os, time, logging, requests
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 
 try:
     from dotenv import load_dotenv; load_dotenv()
@@ -42,13 +42,25 @@ log = logging.getLogger("backfill_oc")
 
 LOTE_SIZE = int(os.getenv("BACKFILL_OC_LOTE", "1500"))
 
+def _corte(dias=None):
+    d = int(dias or os.getenv("OC_REINTENTO_DIAS", "60"))
+    return (datetime.now(timezone.utc) - timedelta(days=d)).isoformat()
+
+
 def _get_pendientes(limit):
     r = requests.get(f"{SB_REST}/{T_HDR}", headers=_sb_headers(),
                      params={"select": "codigo_oc",
                              "raw_hash": "is.null",
+                             # Sin esta ventana las OC que la API no devuelve vuelven
+                             # a encabezar el lote cada noche y el backlog no avanza.
+                             # Con ventana (no veto) se reintentan pasados N dias, por
+                             # si el detalle aparece despues.
+                             "or": f"(last_detail_fetch_at.is.null,last_detail_fetch_at.lt.{_corte()})",
                              "order": "codigo_oc.asc",
                              "limit": str(limit)}, timeout=30)
-    return [row["codigo_oc"] for row in (r.json() if r.ok else [])]
+    if not r.ok:
+        raise RuntimeError(f"PostgREST {r.status_code}: {r.text[:200]}")
+    return [row["codigo_oc"] for row in r.json()]
 
 def main():
     os.makedirs(os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs"), exist_ok=True)
@@ -66,6 +78,11 @@ def main():
             oc = _fetch_detalle(cod)
             time.sleep(SLEEP)
             if not oc:
+                # Marcar el intento: si no, esta OC bloquea la cabeza del lote.
+                _sb_upsert(T_HDR, "codigo_oc", [{
+                    "codigo_oc": cod,
+                    "last_detail_fetch_at": datetime.now(timezone.utc).isoformat(),
+                }])
                 sin_det += 1
                 continue
             hdr, items = parse_oc_detalle(oc)
