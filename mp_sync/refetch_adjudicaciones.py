@@ -42,7 +42,7 @@ Requiere TICKET_ACTIVAS, SUPABASE_URL, SUPABASE_SERVICE_KEY.
 Idempotente: re-correrlo sobre las mismas licitaciones solo las reescribe.
 """
 
-import os, sys, time, logging, requests
+import os, re, sys, time, logging, requests
 from datetime import datetime, timezone
 
 try:
@@ -62,6 +62,36 @@ log = logging.getLogger("refetch_adj")
 
 SCOPE   = (os.getenv("REFETCH_SCOPE") or "bti").strip().lower()
 MAX_LIC = int(os.getenv("REFETCH_MAX", "400"))
+
+# Tipos de proceso que NO son licitacion: licitaciones.json les responde 500 y,
+# como el 500 corta el sleep del loop, cada uno desencadenaba un 429 con 90s de
+# castigo. Se excluyen por el sufijo del codigo (…-RFI25, …-COT26, …-SC24).
+# Fail-open: un tipo desconocido se intenta igual, para no descartar en silencio
+# una licitacion real.
+TIPOS_NO_LICITACION = {t.strip().upper() for t in
+    (os.getenv("REFETCH_EXCLUIR_TIPOS") or "RFI,COT,SC,FTD,AG,CM,TD").split(",") if t.strip()}
+
+_RE_TIPO = re.compile(r"-([A-Z]{1,3}[0-9]?)([0-9]{2})$")
+
+
+def _tipo_de_codigo(cod: str) -> str:
+    m = _RE_TIPO.match(cod[cod.rfind("-"):]) if "-" in cod else None
+    return (m.group(1).upper() if m else "")
+
+
+def _solo_licitaciones(codigos):
+    """Descarta RFI, cotizaciones de compra agil y otros procesos que no son licitacion."""
+    out, descartados = [], {}
+    for c in codigos:
+        t = _tipo_de_codigo(c)
+        if t in TIPOS_NO_LICITACION:
+            descartados[t] = descartados.get(t, 0) + 1
+        else:
+            out.append(c)
+    if descartados:
+        log.info("Descartados por tipo (no son licitacion): %s",
+                 ", ".join(f"{k}={v}" for k, v in sorted(descartados.items())))
+    return out
 
 
 def _sb_get(path, params):
@@ -173,7 +203,7 @@ def _codigos_sin_acta():
             if (r.get("estado") or "") in ("Adjudicada", "Cerrada"):
                 elegibles.append(r["codigo_externo"])
     sin_cabecera = [c for c in faltan if c not in con_cabecera]
-    out = sorted(set(elegibles) | set(sin_cabecera))
+    out = _solo_licitaciones(sorted(set(elegibles) | set(sin_cabecera)))
     log.info("sin_acta: %d códigos (CRM + OC del grupo), %d con acta, "
              "%d objetivos (%d con cabecera adjudicada/cerrada, %d sin cabecera)",
              len(codigos), len(con_acta), len(out), len(elegibles), len(sin_cabecera))
@@ -199,7 +229,7 @@ def _codigos_sin_monto():
 def objetivos():
     if SCOPE == "lista":
         raw = os.getenv("REFETCH_CODIGOS") or ""
-        return [c.strip() for c in raw.split(",") if c.strip()]
+        return [c.strip() for c in raw.split(",") if c.strip()]   # lista explicita: no se filtra
     if SCOPE == "sin_monto":
         return _codigos_sin_monto()
     if SCOPE == "bti":
@@ -225,7 +255,6 @@ def main():
     for i, codigo in enumerate(lote, 1):
         try:
             data = _mp_get({"codigo": codigo})
-            time.sleep(SLEEP)
             lics = data.get("Listado") or []
             if not lics:
                 _sb_upsert(T_LIC, "codigo_externo", [{
@@ -250,6 +279,19 @@ def main():
         except Exception as e:
             log.warning("✗ %s: %s", codigo, repr(e))
             err += 1
+            # Marcar el intento fallido: un 500 permanente (proceso que no existe en
+            # licitaciones.json) no debe volver a encabezar el lote cada noche.
+            try:
+                _sb_upsert(T_LIC, "codigo_externo", [{
+                    "codigo_externo":       codigo,
+                    "last_detail_fetch_at": datetime.now(timezone.utc).isoformat(),
+                }])
+            except Exception:
+                pass
+        finally:
+            # SIEMPRE, no solo cuando la llamada funciona: sin esto un 500 saltaba el
+            # sleep y la rafaga siguiente se comia un 429 con 90 s de castigo.
+            time.sleep(SLEEP)
 
     restantes = max(0, len(codigos) - len(lote))
     log.info("=== Fin: %d ok, %d sin detalle, %d errores | %d filas de adjudicación con monto | "
