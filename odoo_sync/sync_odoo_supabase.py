@@ -127,7 +127,14 @@ TB_CGESTION_PROJECTS = "cgestion_projects"
 # =========================
 # Regex MP
 # =========================
-_RE_MP_ANY = re.compile(r"(\d{3,}-\d{1,3}-[A-Z]{1,4}\d{2})(?:/(\d+))?", re.IGNORECASE)
+# El token de tipo puede llevar un digito propio (B2, L1, R1, E2, H2, I2...), asi que
+# el año son los DOS ULTIMOS digitos, no los dos que siguen a las letras. Con
+# [A-Z]{1,4}\d{2} la regex cortaba "1180885-35-B225" en "1180885-35-B22" y dejaba
+# el 5 afuera: el codigo quedaba invalido, no cruzaba con mp_licitaciones y ademas
+# sync_crm.py creaba una cabecera fantasma con el codigo truncado.
+# \d{0,1}\d{2} absorbe el digito del tipo cuando existe y el (?!\d) impide cortar
+# a medias. Verificado contra B225/B226/L125 y contra LP, LR, LE, LQ, CO, RFI y COT.
+_RE_MP_ANY = re.compile(r"(\d{3,}-\d{1,3}-[A-Z]{1,4}\d{0,1}\d{2})(?!\d)(?:/(\d+))?", re.IGNORECASE)
 
 def parse_mp_from_name(name: Optional[str]) -> Tuple[Optional[str], Optional[int]]:
     if not name:
