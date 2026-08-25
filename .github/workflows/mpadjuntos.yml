@@ -1,0 +1,38 @@
+name: MP · Adjuntos (listar, cada 2h)
+
+# Lista la METADATA de los anexos de las licitaciones priorizadas (las que
+# pegan con el Core de alguien, las marcadas interesa/quizás, y la cola manual
+# del panel). No descarga archivos: eso lo hace la Edge Function
+# mp-obtener-adjunto cuando alguien clickea un documento.
+#
+# Usa los mismos secrets que ya existen en el repo (SUPABASE_URL,
+# SUPABASE_SERVICE_KEY) — no hay que crear ninguno nuevo.
+
+on:
+  schedule:
+    - cron: "35 */2 * * *"    # cada 2h, min :35 — detrás de licitaciones (:15) y CA (:05)
+  workflow_dispatch:           # permite correrlo a mano desde la pestaña Actions
+
+concurrency:
+  group: mp-adjuntos
+  cancel-in-progress: false
+
+jobs:
+  listar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: mp_sync
+    env:
+      SUPABASE_URL:         ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+      ADJ_MAX_LIC_POR_RUN:  "80"     # listar es barato: 2 requests por licitación
+      SLEEP_BETWEEN:        "2.0"    # la ficha de MP tira 429 igual que la API
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - run: python sync_adjuntos.py
