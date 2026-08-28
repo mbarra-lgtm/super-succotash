@@ -2934,7 +2934,14 @@ def sync_budgets_full(odoo: OdooClient, run_ts_iso: str, chunk: int = 500) -> in
                         "achieved_percentage", "committed_percentage", "write_date"]
         fk_head = "budget_analytic_id"
 
-    meta_line = odoo.fields_get(line_model)
+    # fields_get() del cliente pide solo ["string","type"] y NO trae "relation".
+    # Sin relation el detector no puede reconocer los many2one hacia
+    # account.analytic.account y devuelve lista vacia: eso hacia que el sync
+    # mandara analytic_plan_fields=None y BORRARA el vinculo analitico de las 48
+    # lineas en cada ciclo. Se pide explicitamente aca en vez de tocar el helper
+    # compartido, que usan otras 30 funciones.
+    meta_line = odoo.execute_kw(line_model, "fields_get", [],
+                                {"attributes": ["string", "type", "relation"]})
     campos_an = [] if legacy else _campos_analiticos_budget_line(meta_line)
     if campos_an:
         print(f"\u2139\ufe0f  presupuestos: campos de plan analitico = {campos_an}")
@@ -2984,7 +2991,7 @@ def sync_budgets_full(odoo: OdooClient, run_ts_iso: str, chunk: int = 500) -> in
                 achieved_pct = _num_budget(r.get("achieved_percentage"))
                 committed_pct = _num_budget(r.get("committed_percentage"))
 
-            rows_line.append({
+            fila = {
                 "odoo_id": int(r["id"]),
                 "budget_id": budget_id,
                 "budget_name": budget_name or head.get("name"),
@@ -2997,7 +3004,6 @@ def sync_budgets_full(odoo: OdooClient, run_ts_iso: str, chunk: int = 500) -> in
                 "currency_id": currency_id or head.get("currency_id"),
                 "currency_name": currency_name or head.get("currency_name"),
                 "analytic_distribution": dist,
-                "analytic_plan_fields": planes or None,
                 "budget_amount": budget_amount,
                 "committed_amount": committed_amount,
                 "achieved_amount": achieved_amount,
@@ -3006,7 +3012,13 @@ def sync_budgets_full(odoo: OdooClient, run_ts_iso: str, chunk: int = 500) -> in
                 "committed_percentage": committed_pct,
                 "write_date": parse_odoo_dt(r.get("write_date")),
                 "last_seen_at": run_ts_iso,
-            })
+            }
+            # La clave SOLO viaja si hay algo que escribir. El RPC conserva el
+            # valor existente cuando la clave no viene, asi que un fallo de
+            # deteccion deja de poder vaciar el vinculo.
+            if planes:
+                fila["analytic_plan_fields"] = planes
+            rows_line.append(fila)
 
     sb_rpc_upsert("rpc_upsert_odoo_budget_lines", rows_line, batch_size=500)
     print(f"✅ odoo_budget_lines full: {len(rows_line)} filas")
@@ -3035,9 +3047,9 @@ def sync_budgets_full(odoo: OdooClient, run_ts_iso: str, chunk: int = 500) -> in
     # Cada linea sin vinculo es presupuesto que el panel NO va a mostrar: es la
     # unica forma de que una cobertura incompleta se note.
     sin_vinculo = [r for r in rows_line
-                   if not r["analytic_distribution"] and not r["analytic_plan_fields"]]
+                   if not r["analytic_distribution"] and not r.get("analytic_plan_fields")]
     multi = [r for r in rows_line
-             if r["analytic_plan_fields"] and len(r["analytic_plan_fields"]) > 1]
+             if r.get("analytic_plan_fields") and len(r["analytic_plan_fields"]) > 1]
     if sin_vinculo:
         print(f"⚠️ presupuestos: {len(sin_vinculo)}/{len(rows_line)} lineas sin cuenta "
               f"analitica. Revisar v_budget_lines_sin_analitica.")
