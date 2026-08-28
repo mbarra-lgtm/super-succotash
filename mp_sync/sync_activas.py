@@ -2,13 +2,25 @@
 sync_activas.py
 ===============
 Busca licitaciones ACTIVAS nuevas o modificadas.
-Programar: cada 30 minutos.
+Programar: cada 1 hora (ver mp-licitaciones-oc.yml).
 
 Lógica:
-  - Trae el listado del día para estado=activas
-  - Prefetch de hashes en bulk
+  - Trae el listado completo de estado=activas
+  - Prefetch de hashes en bulk (troceado) de TODO el listado
+  - Procesa PRIMERO las que no están en BD: una licitación nueva entra el mismo
+    día sin importar dónde caiga en el orden alfabético
+  - Con el cupo restante refresca en round-robin, con un cursor que NO se
+    resetea por fecha (ver nota abajo)
   - Solo escribe las que son nuevas o cambiaron
-  - Usa cursor para no repetir siempre las mismas
+
+Nota sobre el cursor (bug corregido 2026-08-28)
+-----------------------------------------------
+El cursor se reseteaba a 0 cada medianoche UTC. Con ~4.000 activas, ventana de
+200 y corridas cada 2 h (12/día = 2.400 posiciones), el barrido volvía todos los
+días al mismo tramo inicial y la cola de la lista ordenada nunca se visitaba:
+las activas sobre la posición ~2.400 acumulaban 5+ días sin sincronizar y las
+licitaciones nuevas que caían ahí no se insertaban nunca. El cursor ahora es
+round-robin real: avanza, da la vuelta con módulo y persiste entre días.
 """
 
 import os, sys, time, json, random, logging, requests
@@ -36,6 +48,12 @@ SB_REST      = f"{SUPABASE_URL}/rest/v1"
 
 SLEEP        = float(os.getenv("SLEEP_BETWEEN", "2.0"))
 MAX_POR_RUN  = int(os.getenv("LIC_MAX_POR_RUN", "100"))   # licitaciones por ejecución
+# Cupo maximo de la ventana que se reserva a licitaciones que aun no estan en BD.
+# Por defecto toda la ventana: una corrida puede ser 100% altas si hay atraso.
+MAX_NUEVAS   = int(os.getenv("LIC_MAX_NUEVAS", str(MAX_POR_RUN)))
+# Codigos por request al prefetch de hashes. El filtro va en la URL (in.(...)),
+# asi que trocear evita pasarse del largo maximo con listados de miles.
+HASH_CHUNK   = int(os.getenv("LIC_HASH_CHUNK", "400"))
 CURSOR_FILE  = os.getenv("LIC_CURSOR_FILE",
                os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cursor_activas.json"))
 
@@ -49,14 +67,35 @@ T_ADJ       = "mp_adjudicaciones"
 _session = requests.Session()
 _session.headers.update({"Accept": "application/json"})
 
-def _mp_get(params: dict) -> dict:
-    r = _session.get(MP_API, params={**params, "ticket": MP_TICKET}, timeout=45)
-    if r.status_code == 429:
-        log.warning("429 — esperando 60s...")
-        time.sleep(60)
+class RateLimited(Exception):
+    """429 persistente: la cuota del ticket esta agotada, no es un error del codigo."""
+
+
+def _mp_get(params: dict, intentos: int = 4) -> dict:
+    """GET a la API de MP con backoff ante 429/5xx.
+
+    Antes se reintentaba UNA sola vez ante 429 y, si volvia a fallar, la
+    excepcion la absorbia el except del bucle: la licitacion se contaba como
+    error, el cursor igual avanzaba y esa licitacion quedaba saltada. Ahora el
+    429 persistente sube como RateLimited para que main() corte la corrida sin
+    mover el cursor por encima de lo efectivamente procesado.
+    """
+    espera = 30
+    for intento in range(1, intentos + 1):
         r = _session.get(MP_API, params={**params, "ticket": MP_TICKET}, timeout=45)
-    r.raise_for_status()
-    return r.json()
+        if r.status_code == 429 or r.status_code >= 500:
+            if intento == intentos:
+                if r.status_code == 429:
+                    raise RateLimited(f"429 tras {intentos} intentos")
+                r.raise_for_status()
+            log.warning("HTTP %s — reintento %d/%d en %ds",
+                        r.status_code, intento, intentos, espera)
+            time.sleep(espera)
+            espera = min(espera * 2, 240)
+            continue
+        r.raise_for_status()
+        return r.json()
+    raise RateLimited("sin respuesta utilizable")
 
 def _sb_headers():
     return {"apikey": SB_KEY, "Authorization": f"Bearer {SB_KEY}",
@@ -77,26 +116,48 @@ def _sb_delete(table, col, val):
                     params={col: f"eq.{val}"}, timeout=30)
 
 def _sb_hashes_bulk(codigos: list) -> dict:
-    """Retorna dict codigo_externo -> raw_hash de las que ya existen en BD."""
+    """Retorna dict codigo_externo -> raw_hash de las que ya existen en BD.
+
+    Trocea en lotes de HASH_CHUNK: el filtro viaja en la URL y con listados de
+    miles de codigos un solo request se pasa del largo maximo y vuelve vacio,
+    lo que haria ver TODAS las licitaciones como nuevas.
+    """
     if not codigos: return {}
-    r = requests.get(f"{SB_REST}/{T_LIC}", headers=_sb_headers(),
-                     params={"select": "codigo_externo,raw_hash",
-                             "codigo_externo": f"in.({','.join(codigos)})",
-                             "limit": str(len(codigos)+1)}, timeout=30)
-    return {row["codigo_externo"]: row.get("raw_hash")
-            for row in (r.json() if r.ok else []) if row.get("codigo_externo")}
+    out = {}
+    for i in range(0, len(codigos), HASH_CHUNK):
+        lote = codigos[i:i + HASH_CHUNK]
+        r = requests.get(f"{SB_REST}/{T_LIC}", headers=_sb_headers(),
+                         params={"select": "codigo_externo,raw_hash",
+                                 "codigo_externo": f"in.({','.join(lote)})",
+                                 "limit": str(len(lote)+1)}, timeout=30)
+        if not r.ok:
+            # Falla parcial: se aborta el prefetch entero. Devolver un dict
+            # incompleto marcaria como "nuevas" licitaciones que si estan.
+            raise RuntimeError(f"prefetch de hashes fallo ({r.status_code}): {r.text[:150]}")
+        for row in r.json():
+            if row.get("codigo_externo"):
+                out[row["codigo_externo"]] = row.get("raw_hash")
+    return out
 
 # ── Cursor (persistido en Supabase: mp_sync_cursor, key="activas") ───
 def _load_cursor() -> int:
+    """Posicion del round-robin. NO se resetea por fecha: el barrido de la lista
+    de activas dura mas de un dia y reiniciarlo cada medianoche dejaba la cola
+    de la lista permanentemente sin visitar."""
     try:
-        data = load_cursor("activas", {})
-        if data.get("date") == datetime.now().date().isoformat():
-            return data.get("pos", 0)
-    except Exception: pass
-    return 0
+        return max(0, int(load_cursor("activas", {}).get("pos", 0)))
+    except Exception:
+        return 0
 
-def _save_cursor(pos: int):
-    save_cursor("activas", {"date": datetime.now().date().isoformat(), "pos": pos})
+def _save_cursor(pos: int, total: int = 0, nuevas_pend: int = 0):
+    # 'date' se conserva solo como marca de la ultima corrida (observabilidad);
+    # ya no participa en la decision de resetear.
+    save_cursor("activas", {
+        "date": datetime.now(timezone.utc).date().isoformat(),
+        "pos": pos,
+        "total_activas": total,
+        "nuevas_pendientes": nuevas_pend,
+    })
 
 # ── Parser ───────────────────────────────────
 import hashlib
@@ -216,27 +277,49 @@ def main():
         if c and c not in vistos:
             vistos.add(c); todos.append(c)
     todos.sort()
+    total = len(todos)
+    if not total:
+        log.warning("Listado de activas vacío — se aborta sin tocar el cursor")
+        return
 
-    # 2. Cursor
-    cursor  = _load_cursor()
-    if cursor >= len(todos):
-        cursor = 0
-        log.info("Cursor reseteado — nuevo recorrido")
-    tramo   = todos[cursor: cursor + MAX_POR_RUN]
-    log.info("Activas: %d total, procesando %d (pos %d-%d)",
-             len(todos), len(tramo), cursor, cursor + len(tramo))
+    # 2. Prefetch raw_hash de TODO el listado (troceado). Sirve para dos cosas:
+    #    saber cuáles faltan en BD y detectar cambios sin reescribir de más.
+    hashes      = _sb_hashes_bulk(todos)
+    nuevas_pend = [c for c in todos if c not in hashes]
 
-    # 3. Prefetch raw_hash de las que ya están en BD (para detectar cambios)
-    hashes  = _sb_hashes_bulk(tramo)
-    log.info("En BD: %d/%d — se procesan todas; se escribe solo si el hash cambió",
-             len(hashes), len(tramo))
+    # 3. Ventana de trabajo: primero las altas, después el refresco round-robin.
+    #    Las nuevas van con prioridad porque su posición alfabética es azarosa:
+    #    esperar a que el cursor pase por ahí es lo que hacía que una licitación
+    #    publicada hoy tardara días — o no entrara nunca — en aparecer.
+    tramo_nuevas = nuevas_pend[:MAX_NUEVAS]
+    set_nuevas   = set(tramo_nuevas)
 
-    # 4. Procesar TODAS las del tramo: inserta nuevas y re-lee abiertas modificadas
+    cursor = _load_cursor() % total
+    cupo   = max(0, MAX_POR_RUN - len(tramo_nuevas))
+    tramo_refresh, pos, avance = [], cursor, 0
+    while len(tramo_refresh) < cupo and avance < total:
+        codigo = todos[pos]
+        if codigo not in set_nuevas:
+            tramo_refresh.append(codigo)
+        pos = (pos + 1) % total
+        avance += 1
+    nuevo_cursor = pos
+
+    tramo = tramo_nuevas + tramo_refresh
+    log.info("Activas: %d total | %d sin ingestar (%d en esta corrida) | "
+             "refresco %d desde pos %d", total, len(nuevas_pend),
+             len(tramo_nuevas), len(tramo_refresh), cursor)
+
+    # 4. Procesar el tramo: inserta nuevas y re-lee abiertas modificadas
     ok = nuevas = actualizadas = sin_cambio = err = 0
+    procesadas_refresh = 0
+    corte_cuota = False
     for codigo in tramo:
         try:
             data_det = _mp_get({"codigo": codigo})
             time.sleep(SLEEP)
+            if codigo not in set_nuevas:
+                procesadas_refresh += 1
             lics = data_det.get("Listado") or []
             if not lics: continue
             lic = lics[0]
@@ -264,13 +347,29 @@ def main():
             else:                nuevas += 1
             ok += 1
 
+        except RateLimited as e:
+            # Cuota del ticket agotada: seguir pidiendo solo gasta la ventana y
+            # deja licitaciones saltadas. Se corta y el cursor avanza únicamente
+            # sobre lo que alcanzó a procesarse.
+            log.error("Cuota MP agotada en %s (%s) — se corta la corrida", codigo, e)
+            corte_cuota = True
+            break
         except Exception as e:
             log.warning("Error %s: %s", codigo, repr(e))
             err += 1
 
-    _save_cursor(cursor + len(tramo))  # avanza lo efectivamente recorrido
-    log.info("Resultado: %d nuevas, %d actualizadas, %d sin cambio, %d errores | cursor→%d",
-             nuevas, actualizadas, sin_cambio, err, cursor + len(tramo))
+    # El cursor solo avanza sobre el refresco efectivamente recorrido. Si la
+    # corrida se cortó por cuota, lo pendiente se retoma en la siguiente en vez
+    # de quedar saltado hasta la próxima vuelta completa.
+    if corte_cuota:
+        nuevo_cursor = (cursor + procesadas_refresh) % total
+    _save_cursor(nuevo_cursor, total, max(0, len(nuevas_pend) - nuevas))
+    log.info("Resultado: %d nuevas, %d actualizadas, %d sin cambio, %d errores | "
+             "cursor %d→%d de %d | quedan %d sin ingestar",
+             nuevas, actualizadas, sin_cambio, err, cursor, nuevo_cursor, total,
+             max(0, len(nuevas_pend) - nuevas))
+    if corte_cuota:
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
