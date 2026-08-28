@@ -24,6 +24,13 @@ on:
         description: "Solo inspeccionar (no escribe en Supabase)"
         type: boolean
         default: true
+      tarea:
+        description: "Qué correr"
+        type: choice
+        default: presupuestos
+        options:
+          - presupuestos
+          - backfill-costo-bom
 
 concurrency:
   group: odoo-sync
@@ -51,10 +58,14 @@ jobs:
           python-version: "3.13"
           cache: pip
       - run: pip install -r requirements.txt
-      - name: Re-sincronizar presupuestos
+      - name: Ejecutar
         run: |
-          if [ "${{ inputs.dry_run }}" = "true" ]; then
-            python resync_presupuestos.py --dry-run
-          else
-            python resync_presupuestos.py
+          ARGS=""
+          if [ "${{ inputs.tarea }}" = "backfill-costo-bom" ]; then
+            ARGS="$ARGS --backfill-costo-bom"
           fi
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            ARGS="$ARGS --dry-run"
+          fi
+          echo "python resync_presupuestos.py $ARGS"
+          python resync_presupuestos.py $ARGS
