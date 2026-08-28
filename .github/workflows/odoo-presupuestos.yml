@@ -1,0 +1,60 @@
+# .github/workflows/odoo-presupuestos.yml
+#
+# Re-sincroniza SOLO los presupuestos analíticos (budget.analytic / budget.line).
+#
+# POR QUÉ UN WORKFLOW APARTE. El ciclo de mp-odoo.yml tarda ~20 min y lo dispara
+# pg_cron; los presupuestos son ~50 registros y tardan segundos. Cuando Loreto
+# aprueba un presupuesto y hay que verlo en el panel, esperar el ciclo completo
+# (o forzarlo) es desproporcionado.
+#
+# SIN 'schedule' Y SIN DISPARO DESDE pg_cron: esto es manual a propósito. Los
+# presupuestos ya vienen en cada corrida de mp-odoo.yml; este workflow es para
+# cuando quieres el dato AHORA, no una tercera fuente de escrituras periódicas.
+#
+# MISMO concurrency group que mp-odoo.yml y mp-odoo-full.yml: escribe en las
+# mismas tablas, así que nunca debe correr en paralelo con ellos. Si el ciclo de
+# 20 min está corriendo, este queda en cola y arranca cuando termina.
+
+name: Odoo → Supabase · solo presupuestos
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Solo inspeccionar (no escribe en Supabase)"
+        type: boolean
+        default: true
+
+concurrency:
+  group: odoo-sync
+  cancel-in-progress: false
+
+jobs:
+  presupuestos:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: odoo_sync
+    env:
+      SUPABASE_URL:              ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      SUPABASE_SERVICE_KEY:      ${{ secrets.SUPABASE_SERVICE_KEY }}
+      ODOO_JSONRPC:              ${{ secrets.ODOO_JSONRPC }}
+      ODOO_DB:                   ${{ secrets.ODOO_DB }}
+      ODOO_USER:                 ${{ secrets.ODOO_USER }}
+      ODOO_API_KEY:              ${{ secrets.ODOO_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Re-sincronizar presupuestos
+        run: |
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            python resync_presupuestos.py --dry-run
+          else
+            python resync_presupuestos.py
+          fi
