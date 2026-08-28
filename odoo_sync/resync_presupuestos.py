@@ -375,7 +375,10 @@ def main() -> int:
                 "currency_id": curid or head.get("currency_id"),
                 "currency_name": curname or head.get("currency_name"),
                 "analytic_distribution": {str(k): v for k, v in dist.items()} if dist else None,
-                "analytic_plan_fields": planes or None,
+                # planes va SIEMPRE con contenido o no va: mandar la clave en
+                # null hace que el upsert pise el vinculo con NULL y el
+                # presupuesto desaparezca del panel. Paso dos veces.
+                **({"analytic_plan_fields": planes} if planes else {}),
                 "budget_amount": num(r.get("budget_amount")),
                 "committed_amount": num(r.get("committed_amount")),
                 "achieved_amount": num(r.get("achieved_amount")),
