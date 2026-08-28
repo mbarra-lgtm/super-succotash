@@ -38,7 +38,8 @@ jobs:
     env:
       SUPABASE_URL:         ${{ secrets.SUPABASE_URL }}
       SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
-      TICKET_ACTIVAS:       ${{ secrets.TICKET_ACTIVAS }}
+      # Ver nota en mp-backfill.yml: no compartir cuota con sync_activas.py.
+      TICKET_ACTIVAS:       ${{ secrets.TICKET_BACKFILL || secrets.TICKET_ACTIVAS }}
       SLEEP_BETWEEN:        "2.0"
       REFETCH_SCOPE:        ${{ github.event.inputs.scope || 'bti' }}
       REFETCH_CODIGOS:      ${{ github.event.inputs.codigos || '' }}
