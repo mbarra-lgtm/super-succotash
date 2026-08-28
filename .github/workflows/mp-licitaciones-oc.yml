@@ -1,8 +1,10 @@
-name: MP · Licitaciones (cada 2h)
+name: MP · Licitaciones (cada 1h)
 
 on:
   schedule:
-    - cron: "15 */2 * * *"     # cada 2 horas, minuto 15 (UTC)
+    # Cada hora, minuto 15 (UTC). A 2 h el barrido no alcanzaba a dar una vuelta
+    # completa a las ~4.000 activas y la cola de la lista quedaba sin visitar.
+    - cron: "15 * * * *"
   workflow_dispatch:
 
 concurrency:
@@ -22,7 +24,12 @@ jobs:
       TICKET_ACTIVAS:       ${{ secrets.TICKET_ACTIVAS }}
       CURSOR_BACKEND:       supabase
       SLEEP_BETWEEN:        "2.0"
-      LIC_MAX_POR_RUN:      "200"
+      # 400 × ~2,5 s ≈ 17 min, holgado contra el timeout de 40.
+      # 24 corridas × 400 = 9.600 posiciones/día ≈ 2 vueltas completas.
+      LIC_MAX_POR_RUN:      "400"
+      # Cupo de la ventana reservado a licitaciones que aún no están en BD.
+      # Vacío = toda la ventana si hace falta (útil para drenar el atraso).
+      LIC_MAX_NUEVAS:       "400"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
