@@ -2837,6 +2837,28 @@ def _dist_jsonb(v: Any) -> Optional[dict]:
     return None
 
 
+def _campos_analiticos_budget_line(meta: Dict[str, Any]) -> List[str]:
+    """
+    Todos los many2one de budget.line que apuntan a account.analytic.account.
+
+    CORRECCION 2026-08-28. La version original asumia que budget.line guarda la
+    cuenta en analytic_distribution (jsonb), como purchase.order.line. Medido
+    contra la instancia: las 48 lineas llegaron con ese campo en NULL. En este
+    Odoo la cuenta viaja en un many2one por plan analitico (x_plan<N>_id), que
+    es la columna "Plan Analitico Bertonati" de la ficha.
+
+    No se fija el nombre porque cada plan analitico que alguien cree en Odoo
+    agrega otro campo. Se descubren por relation y se guardan todos crudos; que
+    hacer cuando hay mas de uno lo decide v_budget_line_analytic, donde la regla
+    se ve y se cambia sin volver a sincronizar.
+    """
+    return sorted(
+        f for f, fm in meta.items()
+        if fm.get("type") == "many2one"
+        and fm.get("relation") == "account.analytic.account"
+    )
+
+
 def sync_budgets_full(odoo: OdooClient, run_ts_iso: str, chunk: int = 500) -> int:
     """
     Full sync de presupuestos analiticos hacia odoo_budgets / odoo_budget_lines.
@@ -2912,6 +2934,17 @@ def sync_budgets_full(odoo: OdooClient, run_ts_iso: str, chunk: int = 500) -> in
                         "achieved_percentage", "committed_percentage", "write_date"]
         fk_head = "budget_analytic_id"
 
+    meta_line = odoo.fields_get(line_model)
+    campos_an = [] if legacy else _campos_analiticos_budget_line(meta_line)
+    if campos_an:
+        print(f"\u2139\ufe0f  presupuestos: campos de plan analitico = {campos_an}")
+        desired_line += campos_an
+    elif not legacy:
+        print("\u26a0\ufe0f presupuestos: budget.line no expone ningun many2one a "
+              "account.analytic.account. Si analytic_distribution tambien viene "
+              "vacio, las lineas quedaran sin cuenta: revisar "
+              "v_budget_lines_sin_analitica.")
+
     fields_line = available_fields(odoo, line_model, desired_line)
 
     rows_line: List[dict] = []
@@ -2928,6 +2961,7 @@ def sync_budgets_full(odoo: OdooClient, run_ts_iso: str, chunk: int = 500) -> in
                 # usa Odoo 18 para que la vista de explosion sea una sola.
                 aa_id, _ = m2o(r.get("analytic_account_id"))
                 dist = {str(aa_id): 100.0} if aa_id else None
+                planes = {"analytic_account_id": aa_id} if aa_id else {}
                 budget_amount = _num_budget(r.get("planned_amount"))
                 # En el modelo viejo NO existe el compromiso separado del
                 # devengado: practical_amount es lo ejecutado y punto. Se deja
@@ -2939,6 +2973,11 @@ def sync_budgets_full(odoo: OdooClient, run_ts_iso: str, chunk: int = 500) -> in
                 committed_pct = None
             else:
                 dist = _dist_jsonb(r.get("analytic_distribution"))
+                planes = {}
+                for _f in campos_an:
+                    _aid, _ = m2o(r.get(_f))
+                    if _aid:
+                        planes[_f] = _aid
                 budget_amount = _num_budget(r.get("budget_amount"))
                 committed_amount = _num_budget(r.get("committed_amount"))
                 achieved_amount = _num_budget(r.get("achieved_amount"))
@@ -2958,6 +2997,7 @@ def sync_budgets_full(odoo: OdooClient, run_ts_iso: str, chunk: int = 500) -> in
                 "currency_id": currency_id or head.get("currency_id"),
                 "currency_name": currency_name or head.get("currency_name"),
                 "analytic_distribution": dist,
+                "analytic_plan_fields": planes or None,
                 "budget_amount": budget_amount,
                 "committed_amount": committed_amount,
                 "achieved_amount": achieved_amount,
@@ -2991,6 +3031,19 @@ def sync_budgets_full(odoo: OdooClient, run_ts_iso: str, chunk: int = 500) -> in
     if raras:
         print(f"⚠️ presupuestos: {len(raras)} lineas con clave analitica compuesta "
               f"(multi-plan). Revisar v_budget_lines_clave_rara ANTES de usar el panel.")
+
+    # Cada linea sin vinculo es presupuesto que el panel NO va a mostrar: es la
+    # unica forma de que una cobertura incompleta se note.
+    sin_vinculo = [r for r in rows_line
+                   if not r["analytic_distribution"] and not r["analytic_plan_fields"]]
+    multi = [r for r in rows_line
+             if r["analytic_plan_fields"] and len(r["analytic_plan_fields"]) > 1]
+    if sin_vinculo:
+        print(f"⚠️ presupuestos: {len(sin_vinculo)}/{len(rows_line)} lineas sin cuenta "
+              f"analitica. Revisar v_budget_lines_sin_analitica.")
+    if multi:
+        print(f"ℹ️  presupuestos: {len(multi)} lineas con mas de un plan analitico; "
+              f"la vista elige la cuenta de tipo PROYECTO.")
 
     return len(rows_head) + len(rows_line)
 
