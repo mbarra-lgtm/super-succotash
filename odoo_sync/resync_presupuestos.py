@@ -22,8 +22,18 @@ USO (mismas variables de entorno que el sync grande):
     ODOO_JSONRPC, ODOO_DB, ODOO_USER, ODOO_API_KEY,
     SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY (o SUPABASE_SERVICE_KEY)
 
-    python resync_presupuestos.py            # sincroniza
-    python resync_presupuestos.py --dry-run  # solo inspecciona y muestra, no escribe
+    python resync_presupuestos.py                    # sincroniza presupuestos
+    python resync_presupuestos.py --dry-run          # solo inspecciona, no escribe
+    python resync_presupuestos.py --backfill-costo-bom
+        Rellena sales_notes.costo_bom_nv en TODAS las notas de venta.
+
+BACKFILL: POR QUÉ HACE FALTA. `sync_sales_notes_incremental` filtra por
+`write_date > watermark`, así que cuando se agregó la columna costo_bom_nv solo
+la llenaron las NV modificadas después. Medido: 6 de 794. S01028 (Aduana de
+Arica) tiene write_date del 31-jul y en Odoo su Costo BOM es $150.254.114 —
+el dato existía, el sync nunca volvió a leer esa fila. Una columna nueva en un
+sync incremental siempre necesita un backfill de una vez; después el
+incremental la mantiene sola.
 """
 import os
 import sys
@@ -43,7 +53,8 @@ SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.environ["SUPABASE_SERVICE_KEY"]
 ODOO_LANG    = os.getenv("ODOO_LANG", "es_CL")
 
-DRY_RUN = "--dry-run" in sys.argv
+DRY_RUN  = "--dry-run" in sys.argv
+BACKFILL = "--backfill-costo-bom" in sys.argv
 
 sb = create_client(SUPABASE_URL, SUPABASE_KEY)
 
@@ -173,8 +184,93 @@ def campos_analiticos(meta: Dict[str, Any]) -> List[str]:
     return sorted(out)
 
 
+_NV_COSTO_BOM_CANDIDATOS = [
+    "x_studio_costo_bom",
+    "x_studio_costo_bom_1",
+    "x_studio_costo_de_bom",
+    "x_studio_costo_lista_de_materiales",
+]
+
+
+def detectar_campo_costo_bom(meta: Dict[str, Any]) -> Optional[str]:
+    """Mismo criterio que el sync grande: candidatos conocidos y, si ninguno
+    existe, el primer x_studio_* numérico cuya etiqueta hable de costo y BOM."""
+    for c in _NV_COSTO_BOM_CANDIDATOS:
+        if c in meta:
+            return c
+    for fname, fm in meta.items():
+        if not fname.startswith("x_studio_"):
+            continue
+        if (fm.get("type") or "") not in {"float", "monetary", "integer"}:
+            continue
+        et = f"{fname} {fm.get('string') or ''}".lower()
+        if ("bom" in et or "materiales" in et) and "costo" in et:
+            return fname
+    return None
+
+
+def backfill_costo_bom(odoo: Odoo) -> int:
+    """
+    Rellena sales_notes.costo_bom_nv leyendo TODAS las sale.order.
+
+    Solo toca filas que YA existen en el espejo: un upsert con dos columnas
+    sobre un odoo_id desconocido crearía una NV fantasma sin nombre ni estado.
+    """
+    meta = odoo.fields_get("sale.order")
+    campo = detectar_campo_costo_bom(meta)
+    if not campo:
+        print("❌ No se encontró ningún x_studio_* numérico de costo/BOM en sale.order.")
+        return 1
+    print(f"ℹ️  Campo detectado: {campo} ({meta[campo].get('string')})")
+
+    # ids que ya están en el espejo (paginado: PostgREST corta en 1000)
+    existentes = set()
+    desde = 0
+    while True:
+        r = (sb.table("sales_notes").select("odoo_id")
+               .range(desde, desde + 999).execute())
+        d = getattr(r, "data", None) or []
+        if not d:
+            break
+        existentes.update(x["odoo_id"] for x in d)
+        if len(d) < 1000:
+            break
+        desde += 1000
+    print(f"ℹ️  NV en el espejo: {len(existentes)}")
+
+    rows: List[dict] = []
+    leidas = 0
+    for batch in odoo.search_read_all("sale.order", [], ["id", campo], chunk=500):
+        for r in batch:
+            leidas += 1
+            oid = int(r["id"])
+            if oid not in existentes:
+                continue
+            rows.append({"odoo_id": oid, "costo_bom_nv": num(r.get(campo))})
+
+    con_valor = sum(1 for r in rows if r["costo_bom_nv"] not in (None, 0))
+    print(f"Leídas de Odoo: {leidas} · a actualizar: {len(rows)} · con valor > 0: {con_valor}")
+
+    if DRY_RUN:
+        print("--dry-run: no se escribió nada.")
+        return 0
+
+    for i in range(0, len(rows), 500):
+        res = (sb.table("sales_notes")
+                 .upsert(rows[i:i + 500], on_conflict="odoo_id")
+                 .execute())
+        err = getattr(res, "error", None)
+        if err:
+            raise RuntimeError(f"Supabase upsert sales_notes: {err}")
+    print(f"✅ sales_notes.costo_bom_nv actualizado en {len(rows)} filas")
+    return 0
+
+
 def main() -> int:
     odoo = Odoo()
+
+    if BACKFILL:
+        return backfill_costo_bom(odoo)
 
     if not odoo.fields_get("budget.analytic"):
         print("❌ budget.analytic no existe en esta base.")
