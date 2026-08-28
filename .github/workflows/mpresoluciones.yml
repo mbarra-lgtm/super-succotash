@@ -1,0 +1,82 @@
+# .github/workflows/mp-resoluciones.yml
+#
+# Va en el mismo repo que el resto del pipeline (mbarra-lgtm/super-succotash),
+# junto a los otros workflows de mp_sync. El script vive al lado de los demás
+# (por ejemplo mp_sync/mp_resoluciones_worker.py) — no necesita repo aparte:
+# usa los mismos secrets y la misma base.
+#
+# Secrets requeridos (ya deberían existir para los otros jobs):
+#   SUPABASE_URL
+#   SUPABASE_SERVICE_ROLE_KEY
+
+name: MP · Resoluciones
+
+on:
+  schedule:
+    # 08:15 UTC = 04:15 en Chile (UTC-4). Después del sync de licitaciones,
+    # así la cola v_mp_resoluciones_pendientes ya está al día.
+    - cron: "15 8 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      codigo:
+        description: "Procesar una sola licitación (ej: 1057898-62-LP26)"
+        required: false
+        type: string
+      limit:
+        description: "Máximo de licitaciones por corrida"
+        required: false
+        default: "25"
+        type: string
+
+concurrency:
+  group: mp-resoluciones
+  cancel-in-progress: false
+
+jobs:
+  resoluciones:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Dependencias del sistema
+        run: |
+          sudo apt-get update -qq
+          # poppler-utils = pdftotext. ocrmypdf + tesseract-spa = fallback para
+          # resoluciones escaneadas (hay hartas, sobre todo municipales).
+          sudo apt-get install -y -qq poppler-utils ocrmypdf tesseract-ocr-spa
+
+      - name: Dependencias de Python
+        run: |
+          pip install --quiet playwright supabase
+          playwright install --with-deps chromium
+
+      - name: Procesar cola
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: |
+          if [ -n "${{ inputs.codigo }}" ]; then
+            python mp_sync/mp_resoluciones_worker.py --codigo "${{ inputs.codigo }}"
+          else
+            python mp_sync/mp_resoluciones_worker.py --limit "${{ inputs.limit || 25 }}"
+          fi
+
+      # Si un selector se rompe porque MP cambió el DOM, el screenshot y el HTML
+      # del último intento son lo único que sirve para arreglarlo sin adivinar.
+      - name: Guardar evidencia si falla
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-mp-resoluciones
+          path: |
+            *.png
+            *.html
+          if-no-files-found: ignore
+          retention-days: 7
