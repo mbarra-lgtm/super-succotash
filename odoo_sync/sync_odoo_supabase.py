@@ -109,6 +109,11 @@ TB_PARTIAL_RECONCILES     = "account_partial_reconciles"
 
 TB_ACCOUNT_ANALYTIC_LINES = "account_analytic_lines"
 
+# Presupuesto analitico (Odoo 18: budget.analytic / budget.line)
+TB_ODOO_BUDGETS      = "odoo_budgets"
+TB_ODOO_BUDGET_LINES = "odoo_budget_lines"
+BATCH_BUDGETS        = 500
+
 
 #Nuevas tablas
 
@@ -2786,13 +2791,274 @@ def sync_account_analytic_accounts_full(odoo: OdooClient, chunk: int = 800) -> i
 
 
 # =========================
+# Presupuesto analitico
+# =========================
+# POR QUE FULL Y NO INCREMENTAL. committed_amount y achieved_amount son campos
+# CALCULADOS: cambian cuando llega una OC o una factura, sin que nadie toque el
+# presupuesto, asi que su write_date no se mueve. Un incremental por write_date
+# congelaria los numeros en el valor del dia que se creo el presupuesto —
+# exactamente el mismo motivo por el que account_analytic_accounts ya va full.
+# Son decenas de registros, no miles: el costo es despreciable.
+#
+# POR QUE INTROSPECTIVO. Odoo movio el presupuesto de crossovered.budget (<=16)
+# a budget.analytic / budget.line (17+) y renombro los montos en el camino. En
+# vez de fijar nombres se pregunta por fields_get y se cae al modelo legacy si
+# el nuevo no existe. Un sync que se muere entero por un campo renombrado es
+# peor que uno que omite una columna y lo dice por consola.
+#
+# QUE MIRAR EN LA PRIMERA CORRIDA. La consola imprime el modelo detectado y los
+# campos omitidos. Si aparece "campos no disponibles" con budget_amount,
+# committed_amount o achieved_amount, hay que ajustar la lista de deseados con
+# los nombres reales ANTES de creerle al panel.
+
+def _model_exists(odoo: OdooClient, model: str) -> bool:
+    """True si el modelo esta instalado en esta base. fields_get revienta si no."""
+    try:
+        return bool(odoo.fields_get(model))
+    except Exception:
+        return False
+
+
+def _num_budget(v: Any) -> Optional[float]:
+    """Odoo devuelve False donde no hay monto. Se guarda NULL y no 0 para no
+    confundir 'sin dato' con 'cero': en un presupuesto no es lo mismo."""
+    if v is False or v is None or v == "":
+        return None
+    try:
+        return float(v)
+    except Exception:
+        return None
+
+
+def _dist_jsonb(v: Any) -> Optional[dict]:
+    """analytic_distribution llega como dict {'701': 100.0} o como False."""
+    if isinstance(v, dict) and v:
+        return {str(k): v[k] for k in v}
+    return None
+
+
+def sync_budgets_full(odoo: OdooClient, run_ts_iso: str, chunk: int = 500) -> int:
+    """
+    Full sync de presupuestos analiticos hacia odoo_budgets / odoo_budget_lines.
+
+    Odoo 18: budget.analytic (cabecera) + budget.line (lineas).
+    Odoo <=16: crossovered.budget + crossovered.budget.lines, normalizado al
+    MISMO esquema para que las vistas del espejo no se enteren.
+    """
+    if _model_exists(odoo, "budget.analytic"):
+        head_model, line_model, legacy = "budget.analytic", "budget.line", False
+    elif _model_exists(odoo, "crossovered.budget"):
+        head_model, line_model, legacy = "crossovered.budget", "crossovered.budget.lines", True
+    else:
+        print("⏭️  presupuestos: no hay modelo de presupuesto instalado en Odoo, se omite.")
+        return 0
+
+    print(f"ℹ️  presupuestos: modelo detectado = {head_model} / {line_model}"
+          f"{' (legacy)' if legacy else ''}")
+
+    # ---------- cabeceras ----------
+    desired_head = ["id", "name", "state", "date_from", "date_to",
+                    "user_id", "company_id", "currency_id", "write_date"]
+    if legacy:
+        desired_head += ["creating_user_id"]
+    else:
+        desired_head += ["budget_type", "budget_amount", "committed_amount", "achieved_amount"]
+
+    fields_head = available_fields(odoo, head_model, desired_head)
+
+    heads: Dict[int, dict] = {}
+    rows_head: List[dict] = []
+    for batch in iter_search_read_all(odoo, head_model, [], fields_head,
+                                      chunk=chunk, context={"active_test": False}):
+        for r in batch:
+            user_id, user_name = m2o(r.get("user_id") or r.get("creating_user_id"))
+            company_id, company_name = m2o(r.get("company_id"))
+            currency_id, currency_name = m2o(r.get("currency_id"))
+            row = {
+                "odoo_id": int(r["id"]),
+                "name": (r.get("name") or "").strip() or None,
+                "budget_type": r.get("budget_type") or None,
+                "state": r.get("state") or None,
+                "date_from": parse_odoo_date(r.get("date_from")),
+                "date_to": parse_odoo_date(r.get("date_to")),
+                "user_id": user_id,
+                "user_name": user_name,
+                "company_id": company_id,
+                "company_name": company_name,
+                "currency_id": currency_id,
+                "currency_name": currency_name,
+                "budget_amount": _num_budget(r.get("budget_amount")),
+                "committed_amount": _num_budget(r.get("committed_amount")),
+                "achieved_amount": _num_budget(r.get("achieved_amount")),
+                "write_date": parse_odoo_dt(r.get("write_date")),
+                "last_seen_at": run_ts_iso,
+            }
+            heads[row["odoo_id"]] = row
+            rows_head.append(row)
+
+    sb_rpc_upsert("rpc_upsert_odoo_budgets", rows_head, batch_size=500)
+    print(f"✅ odoo_budgets full: {len(rows_head)} filas")
+
+    # ---------- lineas ----------
+    if legacy:
+        desired_line = ["id", "crossovered_budget_id", "analytic_account_id", "company_id",
+                        "currency_id", "date_from", "date_to", "planned_amount",
+                        "practical_amount", "theoritical_amount", "percentage", "write_date"]
+        fk_head = "crossovered_budget_id"
+    else:
+        desired_line = ["id", "budget_analytic_id", "analytic_distribution", "company_id",
+                        "currency_id", "date_from", "date_to", "budget_amount",
+                        "committed_amount", "achieved_amount", "theoritical_amount",
+                        "achieved_percentage", "committed_percentage", "write_date"]
+        fk_head = "budget_analytic_id"
+
+    fields_line = available_fields(odoo, line_model, desired_line)
+
+    rows_line: List[dict] = []
+    for batch in iter_search_read_all(odoo, line_model, [], fields_line,
+                                      chunk=chunk, context={"active_test": False}):
+        for r in batch:
+            budget_id, budget_name = m2o(r.get(fk_head))
+            head = heads.get(budget_id or -1) or {}
+            company_id, company_name = m2o(r.get("company_id"))
+            currency_id, currency_name = m2o(r.get("currency_id"))
+
+            if legacy:
+                # La cuenta analitica es un m2o; se normaliza al mismo jsonb que
+                # usa Odoo 18 para que la vista de explosion sea una sola.
+                aa_id, _ = m2o(r.get("analytic_account_id"))
+                dist = {str(aa_id): 100.0} if aa_id else None
+                budget_amount = _num_budget(r.get("planned_amount"))
+                # En el modelo viejo NO existe el compromiso separado del
+                # devengado: practical_amount es lo ejecutado y punto. Se deja
+                # committed en NULL en vez de duplicar el valor, para que el
+                # panel muestre "sin dato" y no un compromiso inventado.
+                committed_amount = None
+                achieved_amount = _num_budget(r.get("practical_amount"))
+                achieved_pct = _num_budget(r.get("percentage"))
+                committed_pct = None
+            else:
+                dist = _dist_jsonb(r.get("analytic_distribution"))
+                budget_amount = _num_budget(r.get("budget_amount"))
+                committed_amount = _num_budget(r.get("committed_amount"))
+                achieved_amount = _num_budget(r.get("achieved_amount"))
+                achieved_pct = _num_budget(r.get("achieved_percentage"))
+                committed_pct = _num_budget(r.get("committed_percentage"))
+
+            rows_line.append({
+                "odoo_id": int(r["id"]),
+                "budget_id": budget_id,
+                "budget_name": budget_name or head.get("name"),
+                "budget_state": head.get("state"),
+                "budget_type": head.get("budget_type"),
+                "date_from": parse_odoo_date(r.get("date_from")) or head.get("date_from"),
+                "date_to": parse_odoo_date(r.get("date_to")) or head.get("date_to"),
+                "company_id": company_id or head.get("company_id"),
+                "company_name": company_name or head.get("company_name"),
+                "currency_id": currency_id or head.get("currency_id"),
+                "currency_name": currency_name or head.get("currency_name"),
+                "analytic_distribution": dist,
+                "budget_amount": budget_amount,
+                "committed_amount": committed_amount,
+                "achieved_amount": achieved_amount,
+                "theoritical_amount": _num_budget(r.get("theoritical_amount")),
+                "achieved_percentage": achieved_pct,
+                "committed_percentage": committed_pct,
+                "write_date": parse_odoo_dt(r.get("write_date")),
+                "last_seen_at": run_ts_iso,
+            })
+
+    sb_rpc_upsert("rpc_upsert_odoo_budget_lines", rows_line, batch_size=500)
+    print(f"✅ odoo_budget_lines full: {len(rows_line)} filas")
+
+    # Tombstones: es full sync, asi que lo que no se vio en esta corrida ya no
+    # existe en Odoo. Se marca, no se borra: un presupuesto que desaparece por
+    # un filtro mal puesto no puede evaporar el historico.
+    try:
+        res = sb.rpc("rpc_mark_deleted_odoo_budgets", {"run_ts": run_ts_iso}).execute()
+        n = getattr(res, "data", 0) or 0
+        if n:
+            print(f"🪦 presupuestos: {n} registros marcados como eliminados")
+    except Exception as e:
+        print(f"⚠️ tombstones presupuestos: {e}")
+
+    # Diagnostico barato y de alto valor: si aparecen claves compuestas
+    # ("701,15", multi-plan), v_budget_line_analytic las descarta y el panel
+    # subcuenta el presupuesto sin decirlo.
+    raras = [r for r in rows_line
+             if r["analytic_distribution"]
+             and any(not str(k).isdigit() for k in r["analytic_distribution"].keys())]
+    if raras:
+        print(f"⚠️ presupuestos: {len(raras)} lineas con clave analitica compuesta "
+              f"(multi-plan). Revisar v_budget_lines_clave_rara ANTES de usar el panel.")
+
+    return len(rows_head) + len(rows_line)
+
+
+
+# =========================
 # Incremental: Sales Notes
 # =========================
+# El costo de BOM de la NV vive en un campo x_studio cuyo nombre exacto no esta
+# documentado en ninguna parte y que Studio pudo haber renombrado. En vez de
+# fijarlo a ciegas se descubre una vez por corrida: primero los candidatos que
+# ya vimos, y si ninguno existe, se busca entre los x_studio_* numericos de
+# sale.order uno cuyo nombre tecnico o etiqueta hable de costo y BOM.
+# Si no aparece, se sigue sin la columna y se avisa: perder una columna es
+# mucho mas barato que escribir en ella el campo equivocado.
+_NV_COSTO_BOM_CANDIDATOS = [
+    "x_studio_costo_bom",
+    "x_studio_costo_bom_1",
+    "x_studio_costo_de_bom",
+    "x_studio_costo_lista_de_materiales",
+]
+_NV_COSTO_BOM_FIELD: Optional[str] = None
+_NV_COSTO_BOM_RESUELTO = False
+
+
+def detectar_campo_costo_bom_nv(odoo: OdooClient) -> Optional[str]:
+    global _NV_COSTO_BOM_FIELD, _NV_COSTO_BOM_RESUELTO
+    if _NV_COSTO_BOM_RESUELTO:
+        return _NV_COSTO_BOM_FIELD
+    _NV_COSTO_BOM_RESUELTO = True
+    try:
+        meta = odoo.fields_get("sale.order")
+    except Exception as e:
+        print(f"\u26a0\ufe0f costo BOM NV: no se pudo leer fields_get(sale.order): {e}")
+        return None
+
+    for cand in _NV_COSTO_BOM_CANDIDATOS:
+        if cand in meta:
+            _NV_COSTO_BOM_FIELD = cand
+            print(f"\u2139\ufe0f  costo BOM NV: campo detectado = {cand}")
+            return cand
+
+    numericos = {"float", "monetary", "integer"}
+    for fname, fmeta in meta.items():
+        if not fname.startswith("x_studio_"):
+            continue
+        if (fmeta.get("type") or "") not in numericos:
+            continue
+        etiqueta = f"{fname} {fmeta.get('string') or ''}".lower()
+        if ("bom" in etiqueta or "materiales" in etiqueta) and "costo" in etiqueta:
+            _NV_COSTO_BOM_FIELD = fname
+            print(f"\u2139\ufe0f  costo BOM NV: campo detectado por heuristica = "
+                  f"{fname} ({fmeta.get('string')})")
+            return fname
+
+    print("\u26a0\ufe0f costo BOM NV: no se encontro ningun x_studio_* numerico de costo/BOM "
+          "en sale.order. sales_notes.costo_bom_nv queda en NULL.")
+    return None
+
+
 def sync_sales_notes_incremental(odoo: OdooClient, chunk: int = 800) -> int:
     model = "sale.order"
     table = TB_SALES
 
     desired = ["id", "name", "state", "date_order", "amount_total", "opportunity_id", "partner_id", "write_date"]
+    campo_bom = detectar_campo_costo_bom_nv(odoo)
+    if campo_bom:
+        desired.append(campo_bom)
     fields = available_fields(odoo, model, desired)
 
     last = sb_get_max_write_date(table)
@@ -2816,6 +3082,7 @@ def sync_sales_notes_incremental(odoo: OdooClient, chunk: int = 800) -> int:
                 "partner_id": partner_id,
                 "partner_name": partner_name,
                 "write_date": parse_odoo_dt(r.get("write_date")),
+                "costo_bom_nv": _num_budget(r.get(campo_bom)) if campo_bom else None,
             })
 
         sb_upsert_basic(table, rows, on_conflict="odoo_id", batch_size=1000)
@@ -5064,6 +5331,23 @@ def main():
         sync_account_analytic_accounts_full(odoo, chunk=800)
     except Exception as e:
         print(f"⚠️ account_analytic_accounts full: {e}")
+
+    # Presupuestos: van DESPUES de las cuentas analiticas porque las lineas se
+    # cuelgan de ellas, y ANTES de las vistas del panel, que las cruzan.
+    try:
+        sync_budgets_full(odoo, run_ts_iso, chunk=BATCH_BUDGETS)
+    except Exception as e:
+        print(f"⚠️ presupuestos full: {e}")
+
+    # Las dos materializadas del control presupuestario se refrescan al final
+    # del bloque, no en pg_cron aparte: si el BOM se recalcula en otro momento
+    # que la cuadratura de OF, el panel muestra un lado de hoy contra otro de
+    # ayer y nadie se entera.
+    try:
+        sb.rpc("rpc_refresh_budget_control", {}).execute()
+        print("✅ materializadas del control presupuestario refrescadas")
+    except Exception as e:
+        print(f"⚠️ refresh materializadas presupuesto: {e}")
 
     # -------- NEW Accounting first (recommended) --------
     try:
