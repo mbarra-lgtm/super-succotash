@@ -26,7 +26,9 @@ jobs:
     env:
       SUPABASE_URL:         ${{ secrets.SUPABASE_URL }}
       SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
-      TICKET_ACTIVAS:       ${{ secrets.TICKET_ACTIVAS }}
+      # Ticket propio si existe: los backfills largos se comian la cuota del
+      # ticket de activas y dejaban a sync_activas.py con 429 en su ventana.
+      TICKET_ACTIVAS:       ${{ secrets.TICKET_BACKFILL || secrets.TICKET_ACTIVAS }}
       TICKET_OC:            ${{ secrets.TICKET_OC }}
       CURSOR_BACKEND:       supabase
       SLEEP_BETWEEN:        "2.0"
