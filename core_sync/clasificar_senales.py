@@ -27,6 +27,7 @@ except ImportError:
     pass
 
 import sb
+from prompt_radar import SYSTEM, PROMPT_VERSION, herramienta
 
 logging.basicConfig(
     level=logging.INFO,
@@ -38,7 +39,6 @@ log = logging.getLogger("clasificar_senales")
 # ── Config ──────────────────────────────────────────────────────────────────
 API            = "https://api.anthropic.com/v1/messages"
 MODELO         = os.getenv("RADAR_MODELO", "claude-sonnet-4-5")
-PROMPT_VERSION = "radar-v1"
 ANTHROPIC_KEY  = os.environ["ANTHROPIC_API_KEY"]
 
 MAX_PASAJES     = int(os.getenv("RADAR_MAX_PASAJES", "25"))
@@ -47,86 +47,6 @@ LIMITE_DOCS     = int(os.getenv("RADAR_LIMITE_DOCS", "50"))
 
 T_DOC = "core_documents"
 T_SEN = "core_senales"
-
-SYSTEM = """Eres analista de inteligencia comercial de Bertonati Vehiculos Especiales,
-fabricante chileno de ambulancias, carros bomba, vehiculos blindados y carrozados
-especiales.
-
-Tu trabajo es leer pasajes de actas y acuerdos de Consejos Regionales (CORE) y
-concejos municipales de Chile, y decidir cuales representan una oportunidad
-comercial real para Bertonati.
-
-QUE ES UNA SEÑAL (registrala):
-- Aprobacion de financiamiento (FNDR, circular 33, subvencion municipal, convenio)
-  para ADQUIRIR ambulancias, carros bomba, material mayor de bomberos, vehiculos
-  blindados o moviles de emergencia.
-- Licitacion, adjudicacion o entrega de esos mismos vehiculos.
-- Acuerdos que comprometen presupuesto futuro para renovacion de flota de
-  emergencia, aunque no den la cifra exacta.
-
-QUE NO ES UNA SEÑAL (no la registres, por mucho que aparezca la palabra):
-- Obras y edificios: construccion o reparacion de cuarteles de bomberos, postas,
-  hospitales. Bertonati vende vehiculos, no inmuebles.
-- Lineas de presupuesto genericas: glosas tipo "29 ADQUISICION DE ACTIVOS NO
-  FINANCIEROS / 03 Vehiculos", "dotacion maxima de vehiculos", programas de
-  funcionamiento del propio Gobierno Regional.
-- Vehiculos que no son del rubro: camionetas municipales, buses, maquinaria
-  agricola, camiones aljibe, retroexcavadoras.
-- Menciones de contexto: felicitaciones a bomberos, fiscalizaciones, homenajes,
-  cuentas publicas, agendas de actividades.
-- Compras ya ejecutadas hace mas de 18 meses.
-
-REGLAS DE SALIDA:
-- Un hecho = una señal. Si el mismo proyecto aparece en cinco pasajes del mismo
-  documento, entregalo UNA sola vez.
-- No inventes cifras ni unidades. Si el pasaje no dice cuantas unidades o cuanto
-  dinero, deja el campo en null. Un null honesto vale mas que un numero inventado.
-- Los montos en actas chilenas suelen venir en miles de pesos ("M$354.294" =
-  354.294.000 pesos). Convierte a pesos en monto_clp y deja el texto original
-  en monto_raw.
-- confianza refleja cuan seguro estas de que ESTO es una compra de vehiculos del
-  rubro: 0.9+ solo si el pasaje lo dice explicitamente.
-- Ante la duda, no registres. Un correo con tres señales reales se lee todos los
-  dias; uno con cuarenta se ignora en una semana."""
-
-HERRAMIENTA = {
-    "name": "registrar_senales",
-    "description": "Registra las señales comerciales encontradas. Lista vacía si no hay ninguna.",
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "senales": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "categoria": {"type": "string", "enum": [
-                            "ambulancia", "carro_bomba", "blindado",
-                            "movil_policial", "rescate", "carroceria", "otro"]},
-                        "etapa": {"type": "string", "enum": [
-                            "idea", "financiamiento_aprobado", "licitacion_publicada",
-                            "adjudicada", "entregada", "rechazada"]},
-                        "titulo":          {"type": "string", "description": "Una línea: quién aprueba qué"},
-                        "resumen":         {"type": "string", "description": "2-3 frases"},
-                        "por_que_importa": {"type": "string", "description": "Lectura comercial y timing"},
-                        "unidades":        {"type": ["integer", "null"]},
-                        "monto_clp":       {"type": ["number", "null"], "description": "En pesos, ya convertido"},
-                        "monto_raw":       {"type": ["string", "null"], "description": "El monto tal cual aparece"},
-                        "acuerdo_numero":  {"type": ["string", "null"]},
-                        "codigo_bip":      {"type": ["string", "null"]},
-                        "comuna":          {"type": ["string", "null"]},
-                        "fecha_evento":    {"type": ["string", "null"], "description": "YYYY-MM-DD si el pasaje la da"},
-                        "confianza":       {"type": "number", "minimum": 0, "maximum": 1},
-                    },
-                    "required": ["categoria", "etapa", "titulo", "resumen",
-                                 "por_que_importa", "confianza"],
-                },
-            }
-        },
-        "required": ["senales"],
-    },
-}
-
 
 # ── Pasajes ─────────────────────────────────────────────────────────────────
 
@@ -167,7 +87,7 @@ def pedir_clasificacion(doc: dict, pasajes: list):
         "max_tokens": 4096,
         "system": [{"type": "text", "text": SYSTEM,
                     "cache_control": {"type": "ephemeral"}}],
-        "tools": [HERRAMIENTA],
+        "tools": [herramienta()],
         "tool_choice": {"type": "tool", "name": "registrar_senales"},
         "messages": [{"role": "user", "content": contexto}],
     }
@@ -239,6 +159,11 @@ def documentos_pendientes(doc_id):
     else:
         params["prefiltro_ok"]   = "is.true"
         params["clasificado_at"] = "is.null"
+        # Las notas de prensa las clasifica ingesta_prensa.py en lote. Si una
+        # corrida suya se cae a medio camino, sus documentos quedarían acá y se
+        # procesarían de a uno: correcto, pero carísimo para textos de 300
+        # caracteres. Este filtro deja cada vía con lo suyo.
+        params["extraction_method"] = "neq.rss"
 
     docs = sb.select(T_DOC, params)
     for d in docs:

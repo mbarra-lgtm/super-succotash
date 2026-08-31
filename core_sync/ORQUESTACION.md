@@ -15,6 +15,38 @@ core_sources ──scrape_core.py──> core_documents ──clasificar_senales
                 por fuente)                                                  dedupe)
 ```
 
+## Las dos vías de ingesta
+
+| | Actas CORE | Prensa (RSS) |
+|---|---|---|
+| Script | `scrape_core.py` → `clasificar_senales.py` | `ingesta_prensa.py` |
+| Velocidad | Lenta: el acta se publica 2-6 semanas después de la sesión | Rápida: la nota sale el mismo día |
+| Confiabilidad | Alta: número de acuerdo, monto exacto, votación | Media: titular y bajada, sin detalle |
+| Ruido | Burocrático (glosas presupuestarias) | Crónica policial y de incendios |
+| Filtro | Positivo: pasa casi todo, decide el modelo | **Negativo pesa doble** que el positivo |
+| Llamadas al modelo | Una por acta | Una por lote de 20 notas |
+
+**La prensa dispara, el CORE confirma.** Cuando el acta llega semanas después,
+`fn_core_dedupe_key` la une a la señal que la prensa ya había levantado; no se
+duplica, se enriquece con el número de acuerdo.
+
+### El filtro invertido de prensa
+
+En las actas, "ambulancia" casi no aparece y cuando aparece importa. En la
+prensa chilena es sobre todo crónica: *"fue trasladado en ambulancia al
+hospital"*. Por eso `filtrar_nota()` calcula
+`puntaje = positivos − 2 × negativos` y descarta si no es mayor que cero:
+
+```
+"Joven resultó herido tras accidente y fue trasladado en ambulancia"   → −19  descarta
+"Cinco carros bomba concurrieron al incendio en Talcahuano"            →  −3  descarta
+"Core del Maule aprueba $980 millones del FNDR para 7 ambulancias"     →  +8  clasifica
+"Municipalidad de Curicó entrega nuevo carro bomba"                    →  +3  clasifica
+```
+
+El factor 2 se calibra con `core_senal_feedback`. Si aparecen falsos negativos,
+bajarlo antes que borrar keywords negativas.
+
 ## Secretos
 
 Además de los de `mp_sync` (`SUPABASE_URL`, `SUPABASE_SERVICE_KEY`), este

@@ -52,6 +52,8 @@ MIN_CHARS_POR_PAGINA = int(os.getenv("CORE_MIN_CHARS_PAGINA", "200"))
 MAX_MB               = int(os.getenv("CORE_MAX_MB", "40"))
 MAX_POR_CORRIDA      = int(os.getenv("CORE_MAX_POR_CORRIDA", "15"))
 OCR_HABILITADO       = os.getenv("CORE_OCR", "1") == "1"
+ROBOTS_TIMEOUT       = int(os.getenv("CORE_ROBOTS_TIMEOUT", "10"))
+LANDING_TIMEOUT      = int(os.getenv("CORE_LANDING_TIMEOUT", "25"))
 
 T_DOC = "core_documents"
 
@@ -66,14 +68,25 @@ ANIOS_VIGENTES = {str(a) for a in range(date.today().year - 1, date.today().year
 # ── Descubrimiento ──────────────────────────────────────────────────────────
 
 def _robots_permite(url: str) -> bool:
+    """Consulta robots.txt con timeout propio.
+
+    RobotFileParser.read() usa urlopen SIN timeout: si el host no responde, la
+    corrida se cuelga ahí. En el dry-run del 31-08 la fuente de La Araucanía
+    tardó ~3 minutos en fallar por esto. Se busca el robots con requests y
+    recién después se parsea.
+    """
+    p = up.urlsplit(url)
     try:
-        p = up.urlsplit(url)
+        r = requests.get(f"{p.scheme}://{p.netloc}/robots.txt",
+                         headers=HEADERS, timeout=ROBOTS_TIMEOUT)
+        if r.status_code >= 400:
+            return True   # sin robots.txt: permitido
         rp = robotparser.RobotFileParser()
-        rp.set_url(f"{p.scheme}://{p.netloc}/robots.txt")
-        rp.read()
+        rp.parse(r.text.splitlines())
         return rp.can_fetch(UA, url)
-    except Exception:
-        return True  # sin robots legible: es info pública y vamos lento igual
+    except Exception as e:
+        log.debug("robots.txt de %s no legible (%s): se asume permitido", p.netloc, e)
+        return True  # es info pública y vamos a ritmo lento igual
 
 
 def _fecha_desde_texto(txt: str):
@@ -97,7 +110,7 @@ def descubrir(fuente: dict, session: requests.Session) -> list:
     cfg     = fuente.get("config") or {}
     landing = fuente["landing_url"]
 
-    r = session.get(landing, headers=HEADERS, timeout=45)
+    r = session.get(landing, headers=HEADERS, timeout=LANDING_TIMEOUT)
     r.raise_for_status()
     sopa = BeautifulSoup(r.text, "html.parser")
     raiz = sopa.select_one(cfg["selector_contenedor"]) if cfg.get("selector_contenedor") else None
@@ -246,7 +259,12 @@ def procesar_fuente(fuente: dict, session: requests.Session, dry_run: bool) -> i
         }
 
         if fila["status"] == "parsed":
-            paso, terminos = (False, []) if dry_run else evaluar_prefiltro(fila["extracted_text"])
+            # El prefiltro SÍ corre en dry-run: es una llamada de solo lectura
+            # (fn_core_prefiltro no escribe nada) y es justamente lo que uno
+            # quiere ver en una corrida en seco. Antes se saltaba, y el log
+            # reportaba "descartado por prefiltro" para TODO — un resultado
+            # falso que hacía inútil el dry-run.
+            paso, terminos = evaluar_prefiltro(fila["extracted_text"])
             fila.update({"prefiltro_ok": paso, "prefiltro_keywords": terminos,
                          "prefiltrado_at": datetime.now(timezone.utc).isoformat(),
                          "status": "prefiltrado"})
