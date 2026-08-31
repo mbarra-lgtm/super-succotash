@@ -142,7 +142,8 @@ def construir_fila(senal: dict, doc: dict) -> dict:
         "p_etapa": senal["etapa"], "p_unidades": senal.get("unidades"),
         "p_monto_clp": senal.get("monto_clp"),
         "p_prioridad": doc.get("organismo_prioridad") or 3,
-        "p_confianza": senal.get("confianza", 0.5)})
+        "p_confianza": senal.get("confianza", 0.5),
+        "p_fecha_evento": fecha})
 
     return {
         "document_id": doc["id"], "source_id": doc.get("source_id"),

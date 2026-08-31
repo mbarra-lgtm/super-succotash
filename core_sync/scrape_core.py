@@ -25,6 +25,7 @@ import os, re, io, sys, time, hashlib, logging, argparse, tempfile, subprocess
 import urllib.parse as up
 import urllib.robotparser as robotparser
 from datetime import date, datetime, timezone
+from email.utils import parsedate_to_datetime
 
 import requests
 import pymupdf   # el import `fitz` está deprecado desde PyMuPDF 1.24
@@ -198,7 +199,31 @@ def descargar_y_extraer(url: str, session: requests.Session) -> dict:
     return {"status": "parsed", "file_sha256": sha, "page_count": paginas,
             "extracted_text": texto, "extraction_method": metodo,
             "content_type": r.headers.get("Content-Type"),
+            "published_date": _fecha_publicacion(r),
             "downloaded_at": ahora, "parsed_at": ahora}
+
+
+def _fecha_publicacion(r: requests.Response):
+    """Fecha de publicación del acta, tomada del header Last-Modified.
+
+    Por qué importa: del título del enlace sacamos la fecha de la SESIÓN, no
+    la de publicación. Son cosas distintas y la diferencia es el corazón del
+    radar — un acta de marzo subida ayer es noticia nueva para nosotros; una
+    de marzo que llevaba cinco meses en el sitio es archivo. Sin este dato no
+    se pueden distinguir, y la primera corrida (31-08) mezcló ocho meses de
+    backfill con novedades reales.
+
+    Es gratis: el header ya viene en la respuesta que de todas formas bajamos.
+    No todos los servidores lo mandan; cuando no está, queda null y mandan
+    act_date y discovered_at.
+    """
+    crudo = r.headers.get("Last-Modified")
+    if not crudo:
+        return None
+    try:
+        return parsedate_to_datetime(crudo).date().isoformat()
+    except Exception:
+        return None
 
 
 # ── Prefiltro ───────────────────────────────────────────────────────────────

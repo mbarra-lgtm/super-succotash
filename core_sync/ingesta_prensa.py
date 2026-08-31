@@ -31,6 +31,7 @@ acuerdo. `fn_core_dedupe_key` las une en una sola señal.
 
 import os, re, sys, time, logging, argparse
 import xml.etree.ElementTree as ET
+import urllib.parse as up
 from datetime import date, datetime, timezone, timedelta
 from email.utils import parsedate_to_datetime
 
@@ -93,8 +94,44 @@ def _limpiar(html: str) -> str:
     return " ".join(BeautifulSoup(html, "html.parser").get_text(" ", strip=True).split())
 
 
+def _resolver_url(url: str, session: requests.Session) -> tuple[str, str | None]:
+    """Convierte el redirect de Google News en la URL real del medio.
+
+    Los links del RSS de Google News son de la forma
+    news.google.com/rss/articles/CBMi... — 250 a 300 caracteres de código
+    opaco. Abren bien, pero tienen dos costos: el lector no sabe de qué diario
+    es antes de hacer clic, y Google cambia el esquema cada cierto tiempo, así
+    que un link guardado hoy puede dejar de resolver en unos meses. Para un
+    radar cuyo valor es "acá está la fuente, verifícala", eso es caro.
+
+    Devuelve (url_final, dominio). Si algo falla se queda con la de Google:
+    un link feo que funciona es mejor que ninguno.
+
+    Nota sobre duplicados: la deduplicación de documentos es por
+    document_url, así que si una corrida resuelve y otra no, la misma nota
+    podría entrar dos veces. Lo atrapa igual `dedupe_key` a nivel de señal,
+    que no depende de la URL.
+    """
+    if "news.google.com" not in url:
+        return url, up.urlsplit(url).netloc.replace("www.", "") or None
+    try:
+        r = session.get(url, headers=HEADERS, timeout=15, allow_redirects=True)
+        final = r.url
+        if "news.google.com" not in final:
+            return final, up.urlsplit(final).netloc.replace("www.", "")
+        # Google a veces responde una página con la redirección en el HTML
+        sopa = BeautifulSoup(r.text, "html.parser")
+        for a in sopa.find_all("a", href=True):
+            href = a["href"]
+            if href.startswith("http") and "google.com" not in href:
+                return href, up.urlsplit(href).netloc.replace("www.", "")
+    except Exception as e:
+        log.debug("no se pudo resolver %s: %s", url[:60], e)
+    return url, None
+
+
 def leer_feed(fuente: dict, session: requests.Session) -> list:
-    """Devuelve notas {url, titulo, snippet, medio, fecha} del RSS."""
+    """Devuelve notas {url, titulo, snippet, medio, fecha, dominio} del RSS."""
     r = session.get(fuente["landing_url"], headers=HEADERS, timeout=45)
     r.raise_for_status()
 
@@ -130,11 +167,13 @@ def leer_feed(fuente: dict, session: requests.Session) -> list:
         if not medio and " - " in titulo:
             titulo, medio = titulo.rsplit(" - ", 1)
 
+        url_real, dominio = _resolver_url(link, session)
         notas.append({
-            "url": link,
+            "url": url_real,
+            "dominio": dominio,
             "titulo": titulo[:400],
             "snippet": _limpiar(item.findtext("description") or "")[:1200],
-            "medio": _limpiar(medio)[:200],
+            "medio": (_limpiar(medio) or dominio or "")[:200],
             "fecha": pub.date() if pub else None,
         })
         if len(notas) >= tope:
@@ -269,7 +308,8 @@ def construir_senal(senal: dict, nota: dict, doc_id: int | None, fuente: dict) -
     score = sb.rpc("fn_core_score", {
         "p_etapa": senal["etapa"], "p_unidades": senal.get("unidades"),
         "p_monto_clp": senal.get("monto_clp"), "p_prioridad": 3,
-        "p_confianza": senal.get("confianza", 0.5)})
+        "p_confianza": senal.get("confianza", 0.5),
+        "p_fecha_evento": fecha})
 
     return {
         "document_id": doc_id, "source_id": fuente["id"],
