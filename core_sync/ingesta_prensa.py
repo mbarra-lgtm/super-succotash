@@ -55,7 +55,6 @@ log = logging.getLogger("ingesta_prensa")
 # ── Config ──────────────────────────────────────────────────────────────────
 API           = "https://api.anthropic.com/v1/messages"
 MODELO        = os.getenv("RADAR_MODELO", "claude-sonnet-4-5")
-ANTHROPIC_KEY = os.environ["ANTHROPIC_API_KEY"]
 
 UA      = "BertonatiRadar/1.0 (+https://bertonati.cl; monitoreo de compras publicas)"
 HEADERS = {"User-Agent": UA}
@@ -68,6 +67,22 @@ T_DOC = "core_documents"
 T_SEN = "core_senales"
 
 _KEYWORDS_CACHE: list | None = None
+
+
+def _exigir_api_key() -> str:
+    """Falla temprano y con un mensaje legible.
+
+    Antes la clave se leia del entorno a nivel de modulo: si el secret faltaba
+    o estaba con otro nombre, el script moria con un KeyError crudo en el
+    import, sin decir que faltaba. Es lo que paso en la corrida del 31-08.
+    """
+    clave = os.getenv("ANTHROPIC_API_KEY", "").strip()
+    if not clave:
+        log.error("Falta ANTHROPIC_API_KEY. En GitHub: Settings -> Secrets and "
+                  "variables -> Actions -> New repository secret, con ese nombre "
+                  "exacto. El workflow lo pasa como env al job.")
+        sys.exit(2)
+    return clave
 
 
 # ── Lectura del feed ────────────────────────────────────────────────────────
@@ -195,7 +210,7 @@ def clasificar_lote(notas: list) -> tuple[list, dict]:
         "tool_choice": {"type": "tool", "name": "registrar_senales"},
         "messages": [{"role": "user", "content": contenido}],
     }
-    cabeceras = {"x-api-key": ANTHROPIC_KEY,
+    cabeceras = {"x-api-key": _exigir_api_key(),
                  "anthropic-version": "2023-06-01",
                  "content-type": "application/json"}
 
@@ -376,7 +391,9 @@ def main() -> int:
              "tokens in/out: %s/%s | %.1fs",
              senales, descartadas, fallidas, f"{tok_in:,}", f"{tok_out:,}",
              time.time() - t0)
-    return 1 if fuentes and fallidas > len(fuentes) / 2 else 0
+    # Mismo criterio que scrape_core: una fuente caída no vuelca el pipeline.
+    # La salud vive en v_core_fuentes_salud, no en el exit code.
+    return 0
 
 
 if __name__ == "__main__":

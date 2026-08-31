@@ -85,7 +85,15 @@ def rpc(funcion: str, args: dict):
 
 # ── Helpers de dominio ──────────────────────────────────────────────────────
 
-def fuentes_pendientes(slug: str | None = None) -> list:
+#: Tipos de fuente que NO maneja scrape_core.py. La prensa tiene su propio
+#: script (ingesta_prensa.py): es RSS, no PDF, y su filtro es el inverso.
+#: Sin esta exclusión el scraper de actas se come los feeds y los marca en
+#: error — pasó en la corrida del 31-08.
+TIPOS_NO_DOCUMENTALES = ("rss_prensa",)
+
+
+def fuentes_pendientes(slug: str | None = None,
+                       excluir_no_documentales: bool = True) -> list:
     """Fuentes habilitadas cuya frecuencia_horas ya venció."""
     from datetime import datetime, timezone
 
@@ -96,6 +104,8 @@ def fuentes_pendientes(slug: str | None = None) -> list:
         "enabled": "is.true",
         "order": "last_checked_at.asc.nullsfirst",
     }
+    if excluir_no_documentales:
+        params["fuente_tipo"] = f"not.in.({','.join(TIPOS_NO_DOCUMENTALES)})"
     if slug:
         params["slug"] = f"eq.{slug}"
         return select("core_sources", params)

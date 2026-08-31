@@ -79,6 +79,11 @@ def _robots_permite(url: str) -> bool:
     try:
         r = requests.get(f"{p.scheme}://{p.netloc}/robots.txt",
                          headers=HEADERS, timeout=ROBOTS_TIMEOUT)
+        # RFC 9309: 401 y 403 significan "prohibido completo"; el resto de los
+        # 4xx significan "sin restricciones". La primera versión de este fix
+        # trataba todo 4xx como permitido, que es más laxo que la norma.
+        if r.status_code in (401, 403):
+            return False
         if r.status_code >= 400:
             return True   # sin robots.txt: permitido
         rp = robotparser.RobotFileParser()
@@ -309,9 +314,22 @@ def main() -> int:
 
     log.info("Documentos nuevos: %d | fuentes con error: %d | %.1fs",
              total, fallidas, time.time() - t0)
+    if fallidas:
+        log.warning("%d fuente(s) con error. El detalle vive en "
+                    "v_core_fuentes_salud, no en el exit code.", fallidas)
 
-    # Una fuente caída no puede voltear la corrida; media flota caída sí.
-    return 1 if fuentes and fallidas > len(fuentes) / 2 else 0
+    # Salida SIEMPRE 0 mientras el scraper haya podido correr.
+    #
+    # Antes esto devolvía 1 cuando fallaba más de la mitad de las fuentes, y el
+    # 31-08 eso volteó el pipeline completo: 12 de 18 fuentes en error → exit 1
+    # → GitHub Actions saltó los pasos siguientes → las 11 actas que SÍ se
+    # habían bajado nunca se clasificaron.
+    #
+    # Que un sitio del Estado esté caído es el estado normal del mundo, no una
+    # falla de este job. La salud por fuente ya se registra en core_sources
+    # (consecutive_errors, last_ok_at) y se consulta en v_core_fuentes_salud;
+    # el exit code no es el lugar para eso, porque acá significa "no sigas".
+    return 0
 
 
 if __name__ == "__main__":
