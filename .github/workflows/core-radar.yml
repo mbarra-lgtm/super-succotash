@@ -50,14 +50,17 @@ jobs:
             ${{ inputs.slug && format('--slug {0}', inputs.slug) || '' }} \
             ${{ inputs.dry_run && '--dry-run' || '' }}
 
+      # !cancelled() en vez del success() implícito: si el scraper tropieza con
+      # un sitio caído, las actas que SÍ se bajaron igual se clasifican. Sin
+      # esto, un GORE fuera de línea deja el pipeline entero sin correr.
       - name: Clasificar señales de actas
-        if: ${{ !inputs.dry_run }}
+        if: ${{ !cancelled() && !inputs.dry_run }}
         run: python clasificar_senales.py
 
       # La prensa va aparte: filtro invertido (el diccionario negativo pesa más
       # que el positivo) y clasificación en lote, porque una nota son ~300
       # caracteres y no justifica una llamada por pieza.
       - name: Prensa (RSS)
-        if: ${{ !inputs.slug }}
+        if: ${{ !cancelled() && !inputs.slug }}
         run: |
           python ingesta_prensa.py ${{ inputs.dry_run && '--dry-run' || '' }}
