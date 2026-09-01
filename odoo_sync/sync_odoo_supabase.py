@@ -84,6 +84,8 @@ TB_SALES      = "sales_notes"
 TB_MO         = "manufacturing_orders"
 TB_BOM        = "mrp_boms"
 TB_BOM_LINES  = "mrp_bom_lines"
+TB_WORKCENTERS         = "mrp_workcenters"
+TB_ROUTING_WORKCENTERS = "mrp_routing_workcenters"
 TB_ECO        = "mrp_ecos"
 TB_PICKINGS   = "stock_pickings"
 TB_PICKING_BATCHES = "stock_picking_batches"
@@ -1305,6 +1307,131 @@ def sync_res_companies_incremental(odoo: OdooClient, chunk: int = 300) -> int:
         total += len(rows)
 
     print(f"✅ res_companies incremental: {total} filas (desde write_date>{last})")
+    return total
+
+
+# =========================
+# MRP: centros de trabajo y operaciones de ruta
+# =========================
+
+def sync_mrp_workcenters_incremental(odoo: OdooClient, chunk: int = 300) -> int:
+    """Centros de trabajo con su costo por hora. Es la base para valorizar la mano de
+    obra del SE08 con horas reales en vez de un % sobre los materiales."""
+    model = "mrp.workcenter"
+    table = TB_WORKCENTERS
+
+    if not _model_exists(odoo, model):
+        print(f"⚠️ {model} no disponible en esta base; se omite")
+        return 0
+
+    desired = [
+        "id", "name", "code", "costs_hour", "employee_costs_hour",
+        "active", "company_id", "write_date",
+    ]
+    fields = available_fields(odoo, model, desired)
+
+    last = sb_get_max_write_date(table)
+    domain: list = []
+    if last:
+        domain.append(["write_date", ">", last])
+
+    total = 0
+    ctx = {"active_test": False}
+
+    for batch in iter_search_read_all(odoo, model, domain, fields, chunk=chunk, context=ctx):
+        rows: List[dict] = []
+        for r in batch:
+            company_id, company_name = m2o(r.get("company_id"))
+
+            # Odoo 17+ separa employee_costs_hour; costs_hour sigue siendo el costo del centro.
+            costo_hora = r.get("costs_hour")
+            if costo_hora in (None, False, 0) and r.get("employee_costs_hour") not in (None, False):
+                costo_hora = r.get("employee_costs_hour")
+
+            rows.append({
+                "odoo_id": int(r["id"]),
+                "name": (r.get("name") or "").strip() or None,
+                "code": (r.get("code") or "").strip() or None,
+                "costs_hour": _num_budget(costo_hora),
+                "active": parse_odoo_bool(r.get("active")),
+                "company_id": company_id,
+                "company_name": company_name,
+                "write_date": parse_odoo_dt(r.get("write_date")),
+            })
+
+        sb_upsert_basic(table, rows, on_conflict="odoo_id", batch_size=1000)
+        total += len(rows)
+
+    print(f"✅ mrp_workcenters incremental: {total} filas (desde write_date>{last})")
+    return total
+
+
+def sync_mrp_routing_workcenters_incremental(odoo: OdooClient, chunk: int = 800) -> int:
+    """Operaciones de ruta por BOM: la fuente de horas del SE08.
+    time_cycle es el valor efectivo con que Odoo costea; time_cycle_manual es el
+    ingresado a mano y queda como respaldo cuando time_mode='manual'.
+    bom_code se resuelve leyendo mrp.bom por id (no se confia en el display_name del m2o)."""
+    model = "mrp.routing.workcenter"
+    table = TB_ROUTING_WORKCENTERS
+
+    if not _model_exists(odoo, model):
+        print(f"⚠️ {model} no disponible en esta base; se omite")
+        return 0
+
+    desired = [
+        "id", "name", "bom_id", "workcenter_id",
+        "time_cycle", "time_cycle_manual", "time_mode",
+        "sequence", "company_id", "write_date",
+    ]
+    fields = available_fields(odoo, model, desired)
+
+    last = sb_get_max_write_date(table)
+    domain: list = []
+    if last:
+        domain.append(["write_date", ">", last])
+
+    total = 0
+    ctx = {"active_test": False}
+    bom_code_cache: Dict[int, Optional[str]] = {}
+
+    for batch in iter_search_read_all(odoo, model, domain, fields, chunk=chunk, context=ctx):
+        pendientes = uniq_ints([
+            m2o(r.get("bom_id"))[0] for r in batch
+            if m2o(r.get("bom_id"))[0] not in bom_code_cache
+        ])
+        for part in chunked(pendientes, 300):
+            try:
+                for b in odoo.search_read("mrp.bom", [["id", "in", part]], ["id", "code"],
+                                          limit=len(part), offset=0) or []:
+                    bom_code_cache[int(b["id"])] = (b.get("code") or "").strip() or None
+            except Exception as e:
+                print(f"⚠️ mrp.bom code lookup: {e}")
+
+        rows: List[dict] = []
+        for r in batch:
+            bom_id, _bom_disp = m2o(r.get("bom_id"))
+            wc_id, wc_name = m2o(r.get("workcenter_id"))
+            company_id, _company_name = m2o(r.get("company_id"))
+
+            rows.append({
+                "odoo_id": int(r["id"]),
+                "name": (r.get("name") or "").strip() or None,
+                "bom_id": bom_id,
+                "bom_code": bom_code_cache.get(bom_id) if bom_id else None,
+                "workcenter_id": wc_id,
+                "workcenter_name": wc_name,
+                "time_cycle": _num_budget(r.get("time_cycle")),
+                "time_cycle_manual": _num_budget(r.get("time_cycle_manual")),
+                "time_mode": (r.get("time_mode") or "").strip() or None,
+                "sequence": r.get("sequence"),
+                "company_id": company_id,
+                "write_date": parse_odoo_dt(r.get("write_date")),
+            })
+
+        sb_upsert_basic(table, rows, on_conflict="odoo_id", batch_size=1000)
+        total += len(rows)
+
+    print(f"✅ mrp_routing_workcenters incremental: {total} filas (desde write_date>{last})")
     return total
 
 
@@ -5496,6 +5623,7 @@ def main():
                 ("sale.order",          "sales_notes"),
                 ("crm.lead",            "crm_projects"),
                 ("mrp.eco",             "mrp_ecos"),
+                ("mrp.routing.workcenter", "mrp_routing_workcenters"),
             ]:
                 reconcile_deletions(odoo, _model, _table, run_ts_iso)
             with open(sentinel_mrp, "w") as f:
@@ -5535,6 +5663,16 @@ def main():
         sync_res_companies_incremental(odoo, chunk=300)
     except Exception as e:
         print(f"⚠️ res_companies incremental: {e}")
+
+    try:
+        sync_mrp_workcenters_incremental(odoo, chunk=300)
+    except Exception as e:
+        print(f"⚠️ mrp_workcenters incremental: {e}")
+
+    try:
+        sync_mrp_routing_workcenters_incremental(odoo, chunk=800)
+    except Exception as e:
+        print(f"⚠️ mrp_routing_workcenters incremental: {e}")
 
     try:
         sync_stock_valuation_layers_incremental(odoo, run_ts_iso, chunk=1200)
