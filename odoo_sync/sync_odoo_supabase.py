@@ -5,7 +5,7 @@ import time
 import re
 import json
 import hashlib
-from typing import Any, Dict, List, Optional, Tuple, Iterable
+from typing import Any, Callable, Dict, List, Optional, Tuple, Iterable
 from datetime import datetime, timedelta, timezone, date
 
 import requests
@@ -82,6 +82,17 @@ FORCE_FULL_RESYNC = os.getenv("FORCE_FULL_RESYNC", "0").strip() == "1"
 # El incremental avanza por write_date y una fila borrada en Odoo no tiene
 # write_date que aparezca: sin esto queda viva en el espejo para siempre.
 RECONCILE_DELETIONS = os.getenv("RECONCILE_DELETIONS", "1").strip() == "1"
+
+# Ciclo "hot": corre SOLO los incrementales de los modelos que alimentan los
+# paneles que se miran en el día (tesorería, cierre, cobertura, tablero CRE) y
+# nada más. Sirve para una cadencia corta (cada 5 min) sin repetir cada vez los
+# backfills y los recorridos completos del ciclo normal, que están pensados para
+# cada 20 min. Se activa con HOT_ONLY=1 (mp-odoo-hot.yml).
+HOT_ONLY = os.getenv("HOT_ONLY", "0").strip() == "1"
+# Pasos del ciclo hot, en orden. Cambiar la lista NO requiere tocar código:
+# HOT_STEPS="purchase_orders,purchase_order_lines" en el workflow.
+HOT_STEPS_DEFAULT = "purchase_orders,purchase_order_lines,pickings,moves,manufacturing_orders,crm_projects"
+HOT_STEPS_ENV = [s.strip() for s in os.getenv("HOT_STEPS", HOT_STEPS_DEFAULT).split(",") if s.strip()]
 # Minutos mínimos entre reconciliaciones (el job frecuente corre cada 20 min).
 # 0 = sin espaciado. El job diario (FORCE_FULL_RESYNC=1) la corre siempre.
 RECONCILE_MIN_MINUTES = int(os.getenv("RECONCILE_MIN_MINUTES", "55"))
@@ -5463,11 +5474,78 @@ def reconcile_all_deletions(odoo: OdooClient, run_ts_iso: str) -> dict:
 
 
 # =========================
+# Ciclo "hot" (cadencia corta)
+# =========================
+# Cada entrada es (nombre, función). Se define acá abajo y no arriba con las
+# constantes porque necesita que las funciones de sync ya existan.
+HOT_STEP_FNS: Dict[str, Callable[[OdooClient, str], object]] = {
+    # Tesorería / P2P
+    "purchase_orders":      lambda odoo, ts: sync_purchase_orders_incremental(odoo, chunk=800, full=False),
+    "purchase_order_lines": lambda odoo, ts: sync_purchase_order_lines_incremental(odoo, chunk=1200),
+    # Recepciones y demanda de planta
+    "pickings":             lambda odoo, ts: sync_pickings_incremental(odoo, ts, chunk=1200),
+    "moves":                lambda odoo, ts: sync_moves_incremental(odoo, ts, chunk=1500),
+    "manufacturing_orders": lambda odoo, ts: sync_manufacturing_orders_incremental(odoo, chunk=800),
+    # Etapas de proyecto (tablero CRE)
+    "crm_projects":         lambda odoo, ts: sync_crm_projects_incremental(odoo, chunk=800),
+    # Disponibles pero fuera del set por defecto: son más pesados y no suelen
+    # cambiar la lectura del día.
+    "sales_notes":          lambda odoo, ts: sync_sales_notes_incremental(odoo, chunk=800),
+    "sale_order_lines":     lambda odoo, ts: sync_sale_order_lines_incremental(odoo, chunk=1200),
+    "move_lines":           lambda odoo, ts: sync_move_lines_incremental(odoo, ts, chunk=1500),
+    "stock_quants":         lambda odoo, ts: sync_stock_quants_incremental(odoo, ts, chunk=1000),
+    "analytic_lines":       lambda odoo, ts: sync_account_analytic_lines_incremental(odoo, ts, chunk=1500),
+}
+
+
+def run_hot_cycle(odoo: OdooClient, run_ts_iso: str) -> None:
+    """Ciclo corto: solo incrementales de los modelos calientes + reconciliación.
+
+    No corre backfills, ni full-resyncs, ni los recorridos completos del ciclo
+    normal: la idea es que entre y salga en menos de un minuto para poder
+    dispararlo cada 5. Cada paso va en su propio try, así que un modelo que
+    falla no se lleva el resto del ciclo.
+    """
+    t0 = time.time()
+    print(f"🔥 Ciclo HOT | pasos={','.join(HOT_STEPS_ENV)} | run_ts={run_ts_iso}")
+
+    desconocidos = [p for p in HOT_STEPS_ENV if p not in HOT_STEP_FNS]
+    if desconocidos:
+        print(f"⚠️ HOT_STEPS desconocidos (se ignoran): {', '.join(desconocidos)} "
+              f"| válidos: {', '.join(HOT_STEP_FNS)}")
+
+    for paso in HOT_STEPS_ENV:
+        fn = HOT_STEP_FNS.get(paso)
+        if fn is None:
+            continue
+        try:
+            fn(odoo, run_ts_iso)
+        except Exception as e:
+            print(f"⚠️ hot {paso}: {e}")
+
+    # La reconciliación de bajas trae su propio espaciado (RECONCILE_MIN_MINUTES),
+    # así que ponerla acá no la hace correr cada 5 min: corre la primera vez que
+    # pasó la hora, sea desde el ciclo hot o desde el normal.
+    if RECONCILE_DELETIONS:
+        try:
+            reconcile_all_deletions(odoo, run_ts_iso)
+        except Exception as e:
+            print(f"⚠️ reconciliación de bajas: {e}")
+
+    print(f"🔥 Ciclo HOT terminado en {time.time() - t0:.1f}s")
+
+
+# =========================
 # Main
 # =========================
 def main():
     odoo = OdooClient(ODOO_JSONRPC, ODOO_DB, ODOO_USER, ODOO_API_KEY)
     run_ts_iso = now_utc_iso()
+
+    # El ciclo hot es excluyente: entra, sincroniza lo caliente y se va.
+    if HOT_ONLY:
+        run_hot_cycle(odoo, run_ts_iso)
+        return
 
     # Productos/quants incremental (ligeros)
     try:
