@@ -1,0 +1,55 @@
+name: Odoo → Supabase HOT (cada 5 min, L-V 07-19 CL)
+
+on:
+  # Disparado por pg_cron en Supabase (job 'dispatch-mp-odoo-hot') vía workflow_dispatch.
+  # Sin 'schedule' nativo a propósito, igual que mp-odoo.yml: el cron de GitHub es
+  # best-effort y duplicaría runs.
+  workflow_dispatch:
+
+# Ciclo corto: si una corrida se atrasa, la siguiente la reemplaza — un ciclo hot
+# viejo no aporta nada, el próximo trae lo mismo y más.
+# Grupo propio: NO comparte cola con mp-odoo.yml ni mp-odoo-full.yml, que hacen
+# trabajo distinto y no deben quedar bloqueados por este.
+concurrency:
+  group: odoo-sync-hot
+  cancel-in-progress: true
+
+jobs:
+  hot:
+    runs-on: ubuntu-latest
+    # Un ciclo hot que pasa de 10 min está roto: mejor cortarlo que encimarse.
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: odoo_sync
+    env:
+      RUN_ONCE:                 "1"
+      # Solo el ciclo caliente: nada de backfills ni full-resyncs.
+      HOT_ONLY:                 "1"
+      SKIP_FULL_RESYNC:         "1"
+      # Modelos del ciclo. Default en el script:
+      #   purchase_orders, purchase_order_lines, pickings, moves,
+      #   manufacturing_orders, crm_projects
+      # Descomentar para acotarlo o ampliarlo sin tocar código:
+      # HOT_STEPS:              "purchase_orders,purchase_order_lines"
+      #
+      # La reconciliación de bajas queda ON pero se autolimita a 1 vez por hora
+      # (RECONCILE_MIN_MINUTES), así que no se repite en cada ciclo de 5 min.
+      TZ_LOCAL:                 "America/Santiago"
+      WORK_START_HOUR:          "7"
+      WORK_END_HOUR:            "19"
+      SUPABASE_URL:             ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      SUPABASE_SERVICE_KEY:     ${{ secrets.SUPABASE_SERVICE_KEY }}
+      ODOO_JSONRPC:             ${{ secrets.ODOO_JSONRPC }}
+      ODOO_DB:                  ${{ secrets.ODOO_DB }}
+      ODOO_USER:                ${{ secrets.ODOO_USER }}
+      ODOO_API_KEY:             ${{ secrets.ODOO_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - run: python sync_odoo_supabase.py
