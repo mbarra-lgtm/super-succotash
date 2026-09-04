@@ -76,6 +76,17 @@ SOFT_DELETE_DAYS   = int(os.getenv("SOFT_DELETE_DAYS", "5"))
 SKIP_FULL_RESYNC  = os.getenv("SKIP_FULL_RESYNC", "0").strip() == "1"
 FORCE_FULL_RESYNC = os.getenv("FORCE_FULL_RESYNC", "0").strip() == "1"
 
+# Reconciliación de bajas (unlink) de las tablas de RECONCILE_TARGETS.
+# ON por defecto y en todos los jobs, a diferencia de los full-resync: solo trae
+# el campo `id` de cada modelo, así que es barata y conviene que corra seguido.
+# El incremental avanza por write_date y una fila borrada en Odoo no tiene
+# write_date que aparezca: sin esto queda viva en el espejo para siempre.
+RECONCILE_DELETIONS = os.getenv("RECONCILE_DELETIONS", "1").strip() == "1"
+# Minutos mínimos entre reconciliaciones (el job frecuente corre cada 20 min).
+# 0 = sin espaciado. El job diario (FORCE_FULL_RESYNC=1) la corre siempre.
+RECONCILE_MIN_MINUTES = int(os.getenv("RECONCILE_MIN_MINUTES", "55"))
+RECONCILE_DATASET = "reconcile_bajas"
+
 # =========================
 # Tables
 # =========================
@@ -5317,26 +5328,138 @@ def full_resync_mrp_tables(odoo: OdooClient, run_ts_iso: str) -> dict:
     return out
 
 
-def reconcile_deletions(odoo: OdooClient, model: str, table: str, run_ts_iso: str, id_chunk: int = 5000) -> None:
+def reconcile_deletions(odoo: OdooClient, model: str, table: str, run_ts_iso: str, id_chunk: int = 5000) -> bool:
     """Detección de bajas genérica (soft-delete) para tablas que YA sincronizan
     incrementalmente por su propio write_date (no necesitan re-fetch completo de datos):
     trae solo los IDs vivos de Odoo (liviano), estampa last_seen_at, y marca
-    is_active=false las que ya no aparecen (con umbral de seguridad en la RPC)."""
+    is_active=false las que ya no aparecen (con umbral de seguridad en la RPC).
+
+    Devuelve True si completó las dos etapas (estampar + marcar). Importa: si el
+    estampado falla a mitad de camino hay que ABORTAR sin marcar, porque las filas
+    que quedaron sin estampar se verían como bajas y se darían de baja en falso.
+    """
     live_ids: List[int] = []
-    for batch in iter_search_read_all(odoo, model, [], ["id"], chunk=2000, context={"active_test": False}):
-        live_ids.extend(int(r["id"]) for r in batch)
+    try:
+        for batch in iter_search_read_all(odoo, model, [], ["id"], chunk=2000, context={"active_test": False}):
+            live_ids.extend(int(r["id"]) for r in batch)
+    except Exception as e:
+        print(f"⚠️ reconcile {table}: no se pudieron traer los ids vivos de Odoo: {e}")
+        return False
+
+    # Sin ids no se marca nada: un fetch vacío por error de red daría de baja la
+    # tabla completa (la RPC igual tiene umbral, pero mejor no llegar ahí).
+    if not live_ids:
+        print(f"⚠️ reconcile {table}: Odoo devolvió 0 ids vivos, se aborta por seguridad")
+        return False
+
     for part in chunked(live_ids, id_chunk):
         try:
             sb.rpc("rpc_stamp_last_seen", {"p_table": table, "p_ids": part, "run_ts": run_ts_iso}).execute()
         except Exception as e:
-            print(f"⚠️ stamp {table}: {e}")
-            return
+            print(f"⚠️ stamp {table}: {e} → se aborta el marcado para no dar de baja en falso")
+            return False
     try:
         res = sb.rpc("rpc_mark_deleted_generic", {"p_table": table, "run_ts": run_ts_iso}).execute()
         n = getattr(res, "data", None)
         print(f"🪦 {table}: {n} marcadas baja (soft) | vivos_odoo={len(live_ids)}")
+        return True
     except Exception as e:
+        # El caso típico es el umbral de la RPC ("posible fetch parcial"): no es
+        # ruido, significa que quedó sin reconciliar y hay que mirarlo.
         print(f"⚠️ reconcile {table}: {e}")
+        return False
+
+
+# Tablas que se reconcilian con reconcile_deletions. Deben estar en la lista
+# blanca de rpc_stamp_last_seen / rpc_mark_deleted_generic.
+RECONCILE_TARGETS = [
+    ("purchase.order.line", "purchase_order_lines"),
+    ("sale.order.line",     "sale_order_lines"),
+    ("sale.order",          "sales_notes"),
+    ("crm.lead",            "crm_projects"),
+    ("mrp.eco",             "mrp_ecos"),
+    ("mrp.routing.workcenter", "mrp_routing_workcenters"),
+]
+
+
+def _reconcile_ultimo_run() -> Optional[datetime]:
+    """Última vez que corrió la reconciliación, leída de data_freshness.
+
+    Los runners de GitHub Actions son efímeros, así que un centinela por archivo
+    no sirve para espaciar corridas: el estado tiene que vivir en la base. Se usa
+    data_freshness, que ya es donde se mira la frescura del resto de los datasets.
+    """
+    try:
+        res = (sb.table("data_freshness").select("refreshed_at")
+               .eq("dataset", RECONCILE_DATASET).limit(1).execute())
+        data = getattr(res, "data", None) or []
+        if not data or not data[0].get("refreshed_at"):
+            return None
+        return dtp.parse(data[0]["refreshed_at"])
+    except Exception as e:
+        # Si no se puede leer, se corre igual: perder una reconciliación es peor
+        # que hacerla de más.
+        print(f"⚠️ reconciliación: no se pudo leer data_freshness ({e}), se corre igual")
+        return None
+
+
+def reconcile_all_deletions(odoo: OdooClient, run_ts_iso: str) -> dict:
+    """Corre la reconciliación de bajas de todas las tablas de RECONCILE_TARGETS.
+
+    POR QUÉ VIVE APARTE DE LOS FULL-RESYNC
+      Antes este loop estaba dentro del mismo try que full_resync_mrp_tables(), y
+      solo en el job diario (FORCE_FULL_RESYNC). Dos consecuencias:
+        1. Si el resync MRP se caía o se pasaba del timeout, la reconciliación no
+           corría y el único rastro era un ⚠️ en el log.
+        2. Al correr 1x/día a las 07:00 CL, una línea de OC borrada a las 09:00
+           quedaba viva en el espejo ~22 h — y si se borraba un viernes, hasta el
+           lunes a las 07:00. Mientras tanto seguía sumando al monto del proyecto
+           en el panel de tesorería. Caso real (2026-09-04): 6 OC con 20 líneas
+           borradas entre 08:12 y 09:23 por $810.541, todas con analítica, que
+           inflaban 5 proyectos hasta la pasada del día siguiente.
+      Es barato: solo trae el campo `id` de cada modelo (~25 k ids en total) y hace
+      unas pocas RPC, así que puede correr en el job de 20 minutos.
+    """
+    # Espaciado: estampar last_seen_at reescribe ~19 k filas de
+    # purchase_order_lines, así que hacerlo en cada corrida de 20 min sería
+    # generar basura para autovacuum sin ganar nada. Una vez por hora deja la
+    # ventana de una línea fantasma en <1 h, contra las ~22 h (o el fin de semana
+    # completo) de cuando esto colgaba del job diario.
+    if not FORCE_FULL_RESYNC and RECONCILE_MIN_MINUTES > 0:
+        ultimo = _reconcile_ultimo_run()
+        if ultimo is not None:
+            edad_min = (datetime.now(timezone.utc) - ultimo).total_seconds() / 60
+            if edad_min < RECONCILE_MIN_MINUTES:
+                print(f"⏭️  Reconciliación de bajas: skip "
+                      f"(última hace {edad_min:.0f} min, mínimo {RECONCILE_MIN_MINUTES})")
+                return {}
+
+    print(f"🧹 Reconciliación de bajas | run_ts={run_ts_iso}")
+    out = {}
+    for model, table in RECONCILE_TARGETS:
+        try:
+            out[table] = reconcile_deletions(odoo, model, table, run_ts_iso)
+        except Exception as e:
+            # Una tabla que falla no puede arrastrar a las demás.
+            out[table] = False
+            print(f"⚠️ reconcile {table}: {e}")
+
+    fallaron = [t for t, ok in out.items() if not ok]
+    if fallaron:
+        print(f"⚠️ Reconciliación incompleta en: {', '.join(fallaron)}")
+
+    # Se estampa la corrida incluso si alguna tabla falló: lo que interesa es
+    # cuándo fue el último intento, para no repetirlo en la corrida siguiente.
+    try:
+        sb.rpc("stamp_freshness", {
+            "p_dataset": RECONCILE_DATASET,
+            "p_rows_changed": None,
+            "p_duration_ms": None,
+            "p_source": "sync_odoo_supabase",
+        }).execute()
+    except Exception as e:
+        print(f"⚠️ reconciliación: no se pudo estampar data_freshness ({e})")
+    return out
 
 
 # =========================
@@ -5616,16 +5739,10 @@ def main():
             and now_local.hour >= STOCK_FULL_RESYNC_HOUR
             and not os.path.exists(sentinel_mrp)):
             full_resync_mrp_tables(odoo, run_ts_iso)
-            # Detección de bajas en líneas de OC/NV, cabeceras de venta y oportunidades CRM
-            for _model, _table in [
-                ("purchase.order.line", "purchase_order_lines"),
-                ("sale.order.line",     "sale_order_lines"),
-                ("sale.order",          "sales_notes"),
-                ("crm.lead",            "crm_projects"),
-                ("mrp.eco",             "mrp_ecos"),
-                ("mrp.routing.workcenter", "mrp_routing_workcenters"),
-            ]:
-                reconcile_deletions(odoo, _model, _table, run_ts_iso)
+            # La detección de bajas de líneas de OC/NV, cabeceras de venta y
+            # oportunidades CRM se movió a su propio bloque (reconcile_all_deletions,
+            # más abajo): acá quedaba colgada del resync MRP y no corría si ese
+            # fallaba, y además solo se ejecutaba en el job diario.
             with open(sentinel_mrp, "w") as f:
                 f.write(now_local.isoformat())
         else:
@@ -5633,6 +5750,21 @@ def main():
                   f"(hora={now_local.hour}, skip={SKIP_FULL_RESYNC}, force={FORCE_FULL_RESYNC})")
     except Exception as e:
         print(f"⚠️ FULL resync MRP: {e}")
+
+    # ============================================================
+    # Reconciliación de bajas (unlink) — bloque propio, corre en TODOS los jobs
+    # ------------------------------------------------------------
+    # Va después de los incrementales (así las filas nuevas del día ya están en
+    # el espejo cuando se estampa last_seen_at) y fuera de cualquier full-resync,
+    # para que un resync caído no la arrastre. Apagable con RECONCILE_DELETIONS=0.
+    # ============================================================
+    if RECONCILE_DELETIONS:
+        try:
+            reconcile_all_deletions(odoo, run_ts_iso)
+        except Exception as e:
+            print(f"⚠️ reconciliación de bajas: {e}")
+    else:
+        print("⏭️  Reconciliación de bajas: OFF (RECONCILE_DELETIONS=0)")
 
     try:
         sync_account_analytic_lines_incremental(odoo, run_ts_iso, chunk=1500)
