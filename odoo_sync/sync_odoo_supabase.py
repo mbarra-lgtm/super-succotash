@@ -1388,11 +1388,27 @@ def sync_mrp_workcenters_incremental(odoo: OdooClient, chunk: int = 300) -> int:
     return total
 
 
-def sync_mrp_routing_workcenters_incremental(odoo: OdooClient, chunk: int = 800) -> int:
+def sync_mrp_routing_workcenters_incremental(odoo: OdooClient, chunk: int = 800,
+                                             full: bool = False) -> int:
     """Operaciones de ruta por BOM: la fuente de horas del SE08.
     time_cycle es el valor efectivo con que Odoo costea; time_cycle_manual es el
     ingresado a mano y queda como respaldo cuando time_mode='manual'.
-    bom_code se resuelve leyendo mrp.bom por id (no se confia en el display_name del m2o)."""
+    bom_code se resuelve leyendo mrp.bom por id (no se confia en el display_name del m2o).
+
+    ACTIVE: se espeja el campo `active` de Odoo, y NO se mezcla con is_active (que es
+    el flag de fantasmas del espejo). Se lee con active_test=False a proposito —para
+    poder marcar como archivada una operacion que ya lo esta—, asi que sin espejar
+    `active` las operaciones archivadas entran indistinguibles de las vivas: en Odoo
+    `bom.operation_ids` las excluye y el espejo las sumaba igual. Caso real
+    (07-09-2026): la operacion 12733 "FABRICACION AMBULANCIA MODULADA AEB/AEA/ATS"
+    (12.690 min = 211,5 h) archivada en la LdM 7741 del modulo SE08-0414 MUEBLE PORTA
+    BOLSOS ALUMINIO —donde Odoo muestra 2 operaciones por 14 h— inflaba en 432,7 h el
+    arbol del PT-000018 y su precio sugerido en 3,2%.
+    Todo consumidor de horas debe filtrar `active is not false`.
+
+    FULL: el incremental por write_date nunca vuelve a mirar una fila vieja, asi que
+    una operacion archivada hace meses no se corrige sola. El job diario la llama con
+    full=True para reestampar `active` en todas las filas."""
     model = "mrp.routing.workcenter"
     table = TB_ROUTING_WORKCENTERS
 
@@ -1403,11 +1419,11 @@ def sync_mrp_routing_workcenters_incremental(odoo: OdooClient, chunk: int = 800)
     desired = [
         "id", "name", "bom_id", "workcenter_id",
         "time_cycle", "time_cycle_manual", "time_mode",
-        "sequence", "company_id", "write_date",
+        "sequence", "active", "company_id", "write_date",
     ]
     fields = available_fields(odoo, model, desired)
 
-    last = sb_get_max_write_date(table)
+    last = None if full else sb_get_max_write_date(table)
     domain: list = []
     if last:
         domain.append(["write_date", ">", last])
@@ -1446,6 +1462,7 @@ def sync_mrp_routing_workcenters_incremental(odoo: OdooClient, chunk: int = 800)
                 "time_cycle_manual": _num_budget(r.get("time_cycle_manual")),
                 "time_mode": (r.get("time_mode") or "").strip() or None,
                 "sequence": r.get("sequence"),
+                "active": parse_odoo_bool(r.get("active")),
                 "company_id": company_id,
                 "write_date": parse_odoo_dt(r.get("write_date")),
             })
@@ -1453,7 +1470,8 @@ def sync_mrp_routing_workcenters_incremental(odoo: OdooClient, chunk: int = 800)
         sb_upsert_basic(table, rows, on_conflict="odoo_id", batch_size=1000)
         total += len(rows)
 
-    print(f"✅ mrp_routing_workcenters incremental: {total} filas (desde write_date>{last})")
+    print(f"✅ mrp_routing_workcenters {'FULL' if full else 'incremental'}: "
+          f"{total} filas (desde write_date>{last if not full else 'ALL'})")
     return total
 
 
@@ -5320,6 +5338,13 @@ def full_resync_mrp_tables(odoo: OdooClient, run_ts_iso: str) -> dict:
     print(f"🔄 FULL resync MRP (boms/lines/MO) + reconciliación | run_ts={run_ts_iso}")
     sync_all_boms_incremental(odoo, chunk=800, full=True, run_ts_iso=run_ts_iso)          # boms + líneas
     sync_manufacturing_orders_incremental(odoo, chunk=800, full=True, run_ts_iso=run_ts_iso)  # OFs
+    # Operaciones de ruta: el FULL es lo único que reestampa `active` en las filas
+    # viejas. Sin esto una operación archivada hace meses sigue sumando horas para
+    # siempre, porque el incremental por write_date no la vuelve a mirar.
+    try:
+        sync_mrp_routing_workcenters_incremental(odoo, chunk=800, full=True)
+    except Exception as e:
+        print(f"⚠️ mrp_routing_workcenters FULL: {e}")
 
     out = {}
     for fn, label in [
