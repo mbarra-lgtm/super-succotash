@@ -1375,7 +1375,11 @@ def sync_mrp_workcenters_incremental(odoo: OdooClient, chunk: int = 300) -> int:
                 "name": (r.get("name") or "").strip() or None,
                 "code": (r.get("code") or "").strip() or None,
                 "costs_hour": _num_budget(costo_hora),
-                "active": parse_odoo_bool(r.get("active")),
+                # Igual que en mrp.routing.workcenter: bool() directo, NO
+                # parse_odoo_bool(), que convierte False -> None. Con el helper
+                # los centros de trabajo archivados quedaban en NULL (11 de 24
+                # al 07-09-2026) en vez de false.
+                "active": bool(r.get("active")),
                 "company_id": company_id,
                 "company_name": company_name,
                 "write_date": parse_odoo_dt(r.get("write_date")),
@@ -1462,7 +1466,12 @@ def sync_mrp_routing_workcenters_incremental(odoo: OdooClient, chunk: int = 800,
                 "time_cycle_manual": _num_budget(r.get("time_cycle_manual")),
                 "time_mode": (r.get("time_mode") or "").strip() or None,
                 "sequence": r.get("sequence"),
-                "active": parse_odoo_bool(r.get("active")),
+                # 'active' va con bool() directo, NO con parse_odoo_bool():
+                # ese helper convierte False -> None (porque en el JSON-RPC de Odoo
+                # False es "vacio" para m2o y char), y aca False es el dato que
+                # importa: la operacion archivada. Con parse_odoo_bool las 2.657
+                # archivadas quedaron en NULL y siguieron sumando horas.
+                "active": bool(r.get("active")),
                 "company_id": company_id,
                 "write_date": parse_odoo_dt(r.get("write_date")),
             })
