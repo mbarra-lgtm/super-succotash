@@ -98,6 +98,16 @@ HOT_STEPS_ENV = [s.strip() for s in os.getenv("HOT_STEPS", HOT_STEPS_DEFAULT).sp
 RECONCILE_MIN_MINUTES = int(os.getenv("RECONCILE_MIN_MINUTES", "55"))
 RECONCILE_DATASET = "reconcile_bajas"
 
+# EETT (ficha técnica en product.template, campos x_studio_* creados sep-2026).
+# El backfill completo recorre los templates con ficha cargada; va en el ciclo
+# diario, no en el de 20 min. FORCE_ETT_BACKFILL=1 lo dispara a mano (primera
+# corrida después de crear las columnas en Supabase).
+# ETT_BACKFILL_PREFIX="SE08" acota a una familia mientras se está cargando.
+FORCE_ETT_BACKFILL  = os.getenv("FORCE_ETT_BACKFILL", "0").strip() == "1"
+ETT_BACKFILL_PREFIX = os.getenv("ETT_BACKFILL_PREFIX", "").strip() or None
+# 1 = propaga también las fichas borradas en Odoo (recorre TODOS los templates).
+ETT_BACKFILL_ALL    = os.getenv("ETT_BACKFILL_ALL", "0").strip() == "1"
+
 # =========================
 # Tables
 # =========================
@@ -1909,11 +1919,50 @@ def sync_stock_quants_full_resync(
 _PRODUCT_CACHE: Dict[int, Dict[str, Optional[Any]]] = {}
 CTX_ALL_PRODUCTS = {"active_test": False}
 
+# -------------------------
+# EETT (Especificación Técnica) — campos Studio sobre product.template
+# -------------------------
+# Creados en Odoo (sep-2026) para consolidar la ficha técnica en el ERP y poder
+# armar catálogos automáticos cruzando lo comercial con lo técnico.
+# Se leen también en product.product: product.product _inherits product.template,
+# así que Odoo los expone en el variant sin joins. Si algún día se mueven o se
+# renombran, available_fields() los descarta solo y el sync sigue corriendo.
+ETT_FIELD_MAP: Dict[str, str] = {
+    "x_studio_nombre_comercial": "nombre_comercial",
+    "x_studio_descripcion":      "descripcion_ett",
+    "x_studio_item":             "item",
+    "x_studio_seccion":          "seccion",
+}
+ETT_ODOO_FIELDS: List[str] = list(ETT_FIELD_MAP.keys())
+ETT_SB_COLUMNS:  List[str] = list(ETT_FIELD_MAP.values())
+
+
+def _ett_clean(v: Any) -> Optional[str]:
+    """Odoo devuelve False para char/text vacíos; en el espejo queremos NULL."""
+    if v is False or v is None:
+        return None
+    s = str(v).strip()
+    return s or None
+
+
+def ett_cols(r: dict, fields: List[str]) -> Dict[str, Optional[str]]:
+    """Columnas EETT de una fila, SOLO para los campos que el modelo realmente tiene.
+
+    Devolver un dict vacío cuando el campo no existe es deliberado: un upsert con
+    la clave presente y valor None sobrescribiría con NULL lo que ya estuviera
+    cargado en Supabase.
+    """
+    out: Dict[str, Optional[str]] = {}
+    for odoo_field, col in ETT_FIELD_MAP.items():
+        if odoo_field in fields:
+            out[col] = _ett_clean(r.get(odoo_field))
+    return out
+
 def sync_product_products_incremental(odoo: OdooClient, chunk: int = 800) -> int:
     model = "product.product"
     table = TB_PRODUCTS
 
-    desired = ["id", "default_code", "name", "barcode", "active", "write_date", "standard_price", "product_tmpl_id"]
+    desired = ["id", "default_code", "name", "barcode", "active", "write_date", "standard_price", "product_tmpl_id"] + ETT_ODOO_FIELDS
     fields = available_fields(odoo, model, desired)
 
     domain: list = []
@@ -1944,7 +1993,7 @@ def sync_product_products_incremental(odoo: OdooClient, chunk: int = 800) -> int
                 "active": r.get("active"),
                 "write_date": parse_odoo_dt(r.get("write_date")),
                 "product_tmpl_id": tmpl_id,   # ✅ clave
-
+                **ett_cols(r, fields),        # ✅ EETT heredada del template
             })
 
             _PRODUCT_CACHE[pid] = {
@@ -1969,7 +2018,7 @@ def fetch_product_map(odoo: OdooClient, product_ids: List[int], chunk_ids: int =
 
     missing = [pid for pid in product_ids_u if pid not in _PRODUCT_CACHE]
     if missing:
-        desired = ["id", "default_code", "name", "barcode", "active", "write_date", "standard_price", "product_tmpl_id"]
+        desired = ["id", "default_code", "name", "barcode", "active", "write_date", "standard_price", "product_tmpl_id"] + ETT_ODOO_FIELDS
         fields = available_fields(odoo, "product.product", desired)
 
         upsert_rows: List[dict] = []
@@ -2004,6 +2053,7 @@ def fetch_product_map(odoo: OdooClient, product_ids: List[int], chunk_ids: int =
                     "active": r.get("active"),
                     "write_date": parse_odoo_dt(r.get("write_date")),
                     "product_tmpl_id": tmpl_id,  # ✅ ok
+                    **ett_cols(r, fields),       # ✅ EETT
                 })
 
 
@@ -2032,7 +2082,7 @@ def sync_product_templates_incremental(odoo: OdooClient, chunk: int = 800) -> in
         "categ_id",
         "standard_price",
         "write_date",
-    ]
+    ] + ETT_ODOO_FIELDS
     fields = available_fields(odoo, model, desired)
 
     domain: list = []
@@ -2067,6 +2117,7 @@ def sync_product_templates_incremental(odoo: OdooClient, chunk: int = 800) -> in
                 "categ_name": categ_name,
                 "standard_price": r.get("standard_price"),
                 "write_date": parse_odoo_dt(r.get("write_date")),
+                **ett_cols(r, fields),   # ✅ EETT
             })
 
         sb_upsert_basic(table, rows, on_conflict="odoo_id", batch_size=1000)
@@ -2118,7 +2169,7 @@ def backfill_product_templates_from_products(odoo: OdooClient, chunk_ids: int = 
     desired = [
         "id","name","default_code","barcode","active","type",
         "uom_id","uom_po_id","categ_id","write_date"
-    ]
+    ] + ETT_ODOO_FIELDS
     fields = available_fields(odoo, "product.template", desired)
 
     rows: List[dict] = []
@@ -2152,11 +2203,100 @@ def backfill_product_templates_from_products(odoo: OdooClient, chunk_ids: int = 
                 "categ_id": categ_id,
                 "categ_name": categ_name,
                 "write_date": parse_odoo_dt(r.get("write_date")),
+                **ett_cols(r, fields),   # ✅ EETT
             })
 
     sb_upsert_basic(TB_PRODUCT_TEMPLATES, rows, on_conflict="odoo_id", batch_size=1000)
     print(f"✅ product_templates backfill desde product_products: {len(rows)}")
     return len(rows)
+
+
+# =========================
+# EETT: backfill completo
+# =========================
+def backfill_product_ett(
+    odoo: OdooClient,
+    chunk: int = 1000,
+    only_filled: bool = True,
+    default_code_prefix: Optional[str] = None,
+) -> dict:
+    """Recorre product.template y baja SOLO los campos EETT al espejo.
+
+    Por qué existe: el incremental avanza por write_date. Los productos que ya
+    tenían la ficha cargada ANTES de agregar estas columnas en Supabase no
+    vuelven a aparecer en el incremental hasta que alguien los vuelva a tocar en
+    Odoo. Este backfill los trae igual. También sirve como red de seguridad si
+    alguien edita la ficha directo en Supabase.
+
+    Args:
+        only_filled: True (default) trae solo templates con al menos un campo
+            EETT lleno. Es mucho más barato que recorrer los ~12.500 templates y
+            no borra nada: lo vacío en Odoo ya está vacío en el espejo.
+            Ponerlo en False propaga también los borrados de ficha.
+        default_code_prefix: acota a una familia de códigos, p.ej. "SE08".
+
+    Devuelve: {"templates": n, "variants": n}
+    """
+    model = "product.template"
+
+    desired = ["id", "write_date"] + ETT_ODOO_FIELDS
+    fields = available_fields(odoo, model, desired)
+
+    presentes = [f for f in ETT_ODOO_FIELDS if f in fields]
+    if not presentes:
+        print("⏭️  EETT backfill: ningún campo x_studio_* de EETT existe en product.template")
+        return {"templates": 0, "variants": 0}
+
+    domain: list = []
+    if default_code_prefix:
+        domain.append(["default_code", "=like", f"{default_code_prefix}%"])
+    if only_filled:
+        # OR encadenado en notación polaca: ["|", c1, "|", c2, "|", c3, c4]
+        conds = [[f, "!=", False] for f in presentes]
+        domain += ["|"] * (len(conds) - 1) + conds
+
+    tmpl_rows: List[dict] = []
+    ett_by_tmpl: Dict[int, Dict[str, Optional[str]]] = {}
+
+    for batch in iter_search_read_all(odoo, model, domain, fields, chunk=chunk, context={"active_test": False}):
+        for r in batch:
+            tid = int(r["id"])
+            cols = ett_cols(r, fields)
+            ett_by_tmpl[tid] = cols
+            tmpl_rows.append({"odoo_id": tid, **cols})
+
+    if not tmpl_rows:
+        print("✅ EETT backfill: no hay templates con ficha para bajar")
+        return {"templates": 0, "variants": 0}
+
+    sb_upsert_basic(TB_PRODUCT_TEMPLATES, tmpl_rows, on_conflict="odoo_id", batch_size=1000)
+
+    # Propagar al variant. Se resuelve leyendo el mapa desde Supabase en vez de
+    # volver a preguntarle a Odoo: product_products ya tiene product_tmpl_id.
+    variant_rows: List[dict] = []
+    tmpl_ids = list(ett_by_tmpl.keys())
+    for part in chunked(tmpl_ids, 500):
+        res = (
+            sb.table(TB_PRODUCTS)
+            .select("odoo_id,product_tmpl_id")
+            .in_("product_tmpl_id", part)
+            .execute()
+        )
+        err = getattr(res, "error", None)
+        if err:
+            raise RuntimeError(f"Supabase error leyendo variants por template: {err}")
+        for row in (getattr(res, "data", None) or []):
+            tid = int(row["product_tmpl_id"])
+            cols = ett_by_tmpl.get(tid)
+            if cols:
+                variant_rows.append({"odoo_id": int(row["odoo_id"]), **cols})
+
+    if variant_rows:
+        sb_upsert_basic(TB_PRODUCTS, variant_rows, on_conflict="odoo_id", batch_size=1000)
+
+    print(f"✅ EETT backfill: {len(tmpl_rows)} templates | {len(variant_rows)} variants "
+          f"| only_filled={only_filled} | prefix={default_code_prefix or '—'}")
+    return {"templates": len(tmpl_rows), "variants": len(variant_rows)}
 
 
 
@@ -5592,6 +5732,22 @@ def main():
 
     except Exception as e:
         print(f"⚠️ product_products: {e}")
+
+    # EETT: red de seguridad para las fichas que ya estaban cargadas antes de que
+    # existieran las columnas (el incremental por write_date no las ve). Va en el
+    # full diario, no cada 20 min.
+    try:
+        if FORCE_ETT_BACKFILL or FORCE_FULL_RESYNC or not SKIP_FULL_RESYNC:
+            backfill_product_ett(
+                odoo,
+                chunk=1000,
+                only_filled=not ETT_BACKFILL_ALL,
+                default_code_prefix=ETT_BACKFILL_PREFIX,
+            )
+        else:
+            print("⏭️  EETT backfill: skip (job frecuente)")
+    except Exception as e:
+        print(f"⚠️ EETT backfill: {e}")
 
     try:
         sync_stock_quants_incremental(odoo, run_ts_iso, chunk=1000)
