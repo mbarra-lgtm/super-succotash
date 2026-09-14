@@ -69,28 +69,42 @@ CORE_REGEX_DEFAULT = (
     r"|puesto de mando|movilidad reducida|vehiculo inclusiv)"
 )
 CORE_MOVIL_REGEX = r"(clinica|sala|box|consultorio|dental|odontolog|veterinari|mamograf)"
-CORE_RUBRO3      = ("VEHÍCULOS DE EMERGENCIA", "VEHICULOS DE EMERGENCIA")
+# Rubro ONU de la línea: sólo cuenta si el rubro2 es de vehículos motorizados (el
+# rubro3 "emergencia" aparece también en iluminación, construcciones prefabricadas…)
+CORE_RUBRO2      = "VEHICULOS MOTORIZADOS"
+CORE_RUBRO3      = "VEHICULOS DE EMERGENCIA"
 SERVICIO_REGEX   = (
-    r"(servicio de traslado|traslado de pacient|servicio de ambulanc|mantenci|mantenimiento|reparacion"
+    r"(servicio de traslado|traslado de pacient|traslado en ambulanc|servicio de ambulanc|movilizacion|ploteo|mantenci|mantenimiento|reparacion"
     r"|arriendo|arrendamiento|leasing|seguro|poliza|combustible|neumatic|lubricant|repuesto|capacitacion)"
+)
+# Compras PARA una ambulancia/clínica móvil que no son el vehículo: insumos, fármacos,
+# bolsos, uniformes… Se evalúa sólo sobre el NOMBRE, igual que el regex de core.
+EXCLUIR_REGEX    = (
+    r"(insumo|farmaco|medicamento|bolso|uniforme|vestuario|alimento|material|equipamiento medico"
+    r"|mobiliario|instrumental|dispositivo|articulo|utiles|kit |motocicleta|lancha)"
 )
 _core_rx  = re.compile(os.getenv("LIC_DA_CORE_REGEX") or CORE_REGEX_DEFAULT)
 _movil_rx = re.compile(CORE_MOVIL_REGEX)
 _serv_rx  = re.compile(SERVICIO_REGEX)
+_excl_rx  = re.compile(EXCLUIR_REGEX)
 _TRANS = str.maketrans("áéíóúÁÉÍÓÚñÑüÜ", "aeiouAEIOUnNuU")
 
 def _norm(s):
     return (s or "").translate(_TRANS).lower()
 
-def es_core(nombre, descripcion, rubro3):
-    txt = _norm(nombre) + " " + _norm(descripcion)
-    if _serv_rx.search(txt):
+def es_core(nombre, descripcion, rubro2, rubro3):
+    """Prefiltro de carga: decide si vale la pena guardar TODAS las ofertas de la
+    licitación. Se evalúa sobre el nombre (la descripción mete demasiado ruido:
+    recall medido igual, 43/49 adjudicaciones de BTI, con o sin ella). La
+    definición analítica del core vive en la vista v_core_bti y se afina allá."""
+    n = _norm(nombre)
+    if _serv_rx.search(n) or _excl_rx.search(n):
         return False
-    if _core_rx.search(txt):
+    if _core_rx.search(n):
         return True
-    if _movil_rx.search(txt) and "movil" in txt:
+    if _movil_rx.search(n) and "movil" in n:
         return True
-    return (rubro3 or "").strip().upper() in CORE_RUBRO3
+    return (_norm(rubro2).upper() == CORE_RUBRO2 and _norm(rubro3).upper() == CORE_RUBRO3)
 
 # RUTs objetivo (grupo + competidores) desde mp_competidores
 RUTS_NORM = set()
@@ -276,14 +290,14 @@ def procesar_mes(mes: str, zip_path: str):
             # Cabecera: una vez por licitación. El core se decide por nombre/descr/rubro
             # de la primera línea; si una línea posterior es de emergencia, se promueve.
             if cod not in core_por_lic:
-                core = es_core(r.get("Nombre"), r.get("Descripcion"), r.get("Rubro3"))
+                core = es_core(r.get("Nombre"), r.get("Descripcion"), r.get("Rubro2"), r.get("Rubro3"))
                 core_por_lic[cod] = core
                 buf_l[cod] = parse_licitacion(r, mes, core)
                 if core:
                     n_core += 1
                     if len(ejemplos_core) < 5: ejemplos_core.append(f"{cod} · {(r.get('Nombre') or '')[:60]}")
                 if len(buf_l) >= 1000: flush_l()
-            elif not core_por_lic[cod] and (r.get("Rubro3") or "").strip().upper() in CORE_RUBRO3:
+            elif not core_por_lic[cod] and es_core(r.get("Nombre"), None, r.get("Rubro2"), r.get("Rubro3")):
                 core_por_lic[cod] = True; n_core += 1
                 fila = parse_licitacion(r, mes, True)
                 if cod in buf_l: buf_l[cod] = fila          # aún no se envió: se reemplaza en el buffer
