@@ -248,9 +248,22 @@ def procesar_mes(mes: str, zip_path: str):
     log.info("  %s: abriendo %s (%s MB descomprimido)", mes, name, f"{z.getinfo(name).file_size / 1e6:,.0f}")
 
     core_por_lic = {}            # codigo_externo -> bool (decidido con la primera fila)
-    buf_l, buf_o = [], []
+    # Los buffers son dicts por clave: PostgREST hace un solo INSERT ... ON CONFLICT y
+    # Postgres rechaza dos filas con la misma clave en el mismo comando (error 21000).
+    buf_l, buf_o = {}, {}        # codigo_externo -> fila | line_hash -> fila
+    promos = {}                  # cabeceras ya enviadas que después se promovieron a core
     n_rows = n_l = n_o = n_core = n_comp = 0
     ejemplos_core = []
+
+    def flush_l():
+        nonlocal buf_l, n_l
+        if buf_l:
+            _sb_upsert(T_LIC, "codigo_externo", list(buf_l.values())); n_l += len(buf_l); buf_l = {}
+
+    def flush_o():
+        nonlocal buf_o, n_o
+        if buf_o:
+            _sb_upsert(T_OF, "line_hash", list(buf_o.values())); n_o += len(buf_o); buf_o = {}
 
     with z.open(name) as f:
         reader = csv.DictReader(io.TextIOWrapper(f, encoding="cp1252", errors="replace"), delimiter=";")
@@ -265,32 +278,36 @@ def procesar_mes(mes: str, zip_path: str):
             if cod not in core_por_lic:
                 core = es_core(r.get("Nombre"), r.get("Descripcion"), r.get("Rubro3"))
                 core_por_lic[cod] = core
-                buf_l.append(parse_licitacion(r, mes, core))
+                buf_l[cod] = parse_licitacion(r, mes, core)
                 if core:
                     n_core += 1
                     if len(ejemplos_core) < 5: ejemplos_core.append(f"{cod} · {(r.get('Nombre') or '')[:60]}")
-                if len(buf_l) >= 1000:
-                    _sb_upsert(T_LIC, "codigo_externo", buf_l); n_l += len(buf_l); buf_l = []
+                if len(buf_l) >= 1000: flush_l()
             elif not core_por_lic[cod] and (r.get("Rubro3") or "").strip().upper() in CORE_RUBRO3:
                 core_por_lic[cod] = True; n_core += 1
-                buf_l.append(parse_licitacion(r, mes, True))   # re-upsert con es_core=true
+                fila = parse_licitacion(r, mes, True)
+                if cod in buf_l: buf_l[cod] = fila          # aún no se envió: se reemplaza en el buffer
+                else:            promos[cod] = fila         # ya se envió: se re-upserta al final
 
             # Ofertas: licitación core o RUT objetivo ofertando
             es_comp = norm_rut(r.get("RutProveedor")) in RUTS_NORM
             if core_por_lic[cod] or es_comp:
                 if es_comp and not core_por_lic[cod]: n_comp += 1
-                buf_o.append(parse_oferta(r, mes))
+                of = parse_oferta(r, mes)
+                buf_o[of["line_hash"]] = of
                 if len(buf_o) >= 1000:
-                    if buf_l:   # FK: cabeceras antes que ofertas
-                        _sb_upsert(T_LIC, "codigo_externo", buf_l); n_l += len(buf_l); buf_l = []
-                    _sb_upsert(T_OF, "line_hash", buf_o); n_o += len(buf_o); buf_o = []
+                    flush_l()      # FK: cabeceras antes que ofertas
+                    flush_o()
 
             if n_rows % 50000 == 0:
                 log.info("  %s: %s filas | lic %s | core %s | ofertas %s",
                          mes, f"{n_rows:,}", f"{len(core_por_lic):,}", n_core, f"{n_o + len(buf_o):,}")
 
-    if buf_l: _sb_upsert(T_LIC, "codigo_externo", buf_l); n_l += len(buf_l)
-    if buf_o: _sb_upsert(T_OF, "line_hash", buf_o); n_o += len(buf_o)
+    flush_l()
+    if promos:
+        _sb_upsert(T_LIC, "codigo_externo", list(promos.values()))
+        log.info("  %s: %d cabeceras promovidas a core por rubro de una línea posterior", mes, len(promos))
+    flush_o()
 
     log.info("✅ %s: %s filas CSV → %s licitaciones (%s core, %s con competidor fuera del core), %s ofertas · %.0fs",
              mes, f"{n_rows:,}", f"{len(core_por_lic):,}", n_core, n_comp, f"{n_o:,}", time.time() - t0)
