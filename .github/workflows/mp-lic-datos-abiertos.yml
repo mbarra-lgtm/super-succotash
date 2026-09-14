@@ -1,0 +1,48 @@
+name: MP · Licitaciones Datos Abiertos (carga mensual masiva)
+
+# Fuente histórica y de ofertas. Un archivo por mes de publicación:
+#   https://transparenciachc.blob.core.windows.net/lic-da/{AÑO}-{MES}.zip
+# Los archivos se REGENERAN (traen la adjudicación aunque ocurra meses después),
+# por eso el default recarga el mes vencido y los dos anteriores.
+#
+# Carga inicial (una vez), desde Actions → Run workflow:
+#   meses = 2024-1,2024-2,...,2025-6   (o en dos tandas si prefieres)
+# Cada mes son ~15–25 MB de descarga y 1–3 minutos de proceso.
+
+on:
+  schedule:
+    - cron: "30 6 22 * *"     # día 22, 06:30 UTC — media hora después de la carga de OC
+  workflow_dispatch:
+    inputs:
+      meses:
+        description: "Meses a cargar, ej: 2024-1,2024-2 (vacío = mes vencido + dos anteriores)"
+        default: ""
+      sin_consolidar:
+        description: "Sólo aterrizar en mp_da_* sin tocar las tablas canónicas (1 = sí)"
+        default: "0"
+
+concurrency:
+  group: mp-lic-datos-abiertos
+  cancel-in-progress: false
+
+jobs:
+  cargar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    defaults:
+      run:
+        working-directory: mp_sync
+    env:
+      SUPABASE_URL:          ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_KEY:  ${{ secrets.SUPABASE_SERVICE_KEY }}
+      LIC_DA_MESES:          ${{ github.event.inputs.meses }}
+      LIC_DA_SIN_CONSOLIDAR: ${{ github.event.inputs.sin_consolidar || '0' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Cargar licitaciones desde Datos Abiertos
+        run: python ingesta_lic_datos_abiertos.py
