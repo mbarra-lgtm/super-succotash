@@ -65,10 +65,13 @@ BLOB = "https://transparenciachc.blob.core.windows.net/lic-da/{mes}.zip"
 # Aljibes y limpiafosas quedan fuera a propósito: se importan, no se fabrican.
 CORE_REGEX_DEFAULT = (
     r"(ambulanc|carroza|carroceri|carro bomba|carrobomba|carro de rescate|rescate vehicular"
-    r"|oficina movil|unidad movil|biblioteca movil|primer ataque|primera intervencion"
-    r"|puesto de mando|movilidad reducida|vehiculo inclusiv)"
+    r"|oficina movil|unidad movil|primer ataque|primera intervencion"
+    r"|puesto de mando|puesto de comando|comando movil|reten movil|movilidad reducida|vehiculo inclusiv|vehiculo especial)"
 )
-CORE_MOVIL_REGEX = r"(clinica|sala|box|consultorio|dental|odontolog|veterinari|mamograf)"
+CORE_MOVIL_REGEX = r"(clinica|sala|box|consultorio|dental|odontolog|veterinari|mamograf|biblioteca)"
+# "vehículo adaptado/acondicionado/implementado/habilitado como…": carrozado dicho de otra forma
+CORE_ADAPTADO_RX = re.compile(r"(adaptad|acondicionad|implementad|habilitad)")
+CORE_BASE_RX     = re.compile(r"(vehicul|camion|furgon|camioneta|minibus|carro de arrastre)")
 # Rubro ONU de la línea: sólo cuenta si el rubro2 es de vehículos motorizados (el
 # rubro3 "emergencia" aparece también en iluminación, construcciones prefabricadas…)
 CORE_RUBRO2      = "VEHICULOS MOTORIZADOS"
@@ -81,7 +84,7 @@ SERVICIO_REGEX   = (
 # bolsos, uniformes… Se evalúa sólo sobre el NOMBRE, igual que el regex de core.
 EXCLUIR_REGEX    = (
     r"(insumo|farmaco|medicamento|bolso|uniforme|vestuario|alimento|material|equipamiento medico"
-    r"|mobiliario|instrumental|dispositivo|articulo|utiles|kit |motocicleta|lancha)"
+    r"|mobiliario|instrumental|dispositivo|articulo|utiles|kit |motocicleta|lancha|aljibe|limpiafosa)"
 )
 _core_rx  = re.compile(os.getenv("LIC_DA_CORE_REGEX") or CORE_REGEX_DEFAULT)
 _movil_rx = re.compile(CORE_MOVIL_REGEX)
@@ -103,6 +106,8 @@ def es_core(nombre, descripcion, rubro2, rubro3):
     if _core_rx.search(n):
         return True
     if _movil_rx.search(n) and "movil" in n:
+        return True
+    if CORE_ADAPTADO_RX.search(n) and CORE_BASE_RX.search(n):
         return True
     return (_norm(rubro2).upper() == CORE_RUBRO2 and _norm(rubro3).upper() == CORE_RUBRO3)
 
