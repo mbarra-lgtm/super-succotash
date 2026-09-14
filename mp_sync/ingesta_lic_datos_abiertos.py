@@ -74,7 +74,7 @@ CORE_MOVIL_REGEX = r"(clinica|sala|box|consultorio|dental|odontolog|veterinari|m
 CORE_RUBRO2      = "VEHICULOS MOTORIZADOS"
 CORE_RUBRO3      = "VEHICULOS DE EMERGENCIA"
 SERVICIO_REGEX   = (
-    r"(servicio de traslado|traslado de pacient|traslado en ambulanc|servicio de ambulanc|movilizacion|ploteo|mantenci|mantenimiento|reparacion"
+    r"(servicios? de traslado|traslado de pacient|traslado en ambulanc|servicios? de ambulanc|aero ?ambulanc|operativo|movilizacion|ploteo|mantenci|mantenimiento|mttos?\b|reparacion"
     r"|arriendo|arrendamiento|leasing|seguro|poliza|combustible|neumatic|lubricant|repuesto|capacitacion)"
 )
 # Compras PARA una ambulancia/clínica móvil que no son el vehículo: insumos, fármacos,
@@ -105,6 +105,20 @@ def es_core(nombre, descripcion, rubro2, rubro3):
     if _movil_rx.search(n) and "movil" in n:
         return True
     return (_norm(rubro2).upper() == CORE_RUBRO2 and _norm(rubro3).upper() == CORE_RUBRO3)
+
+def cargar_ofertas(nombre, descripcion, rubro2):
+    """Red ancha: ¿guardamos las ofertas de esta licitación aunque no sea core estricto?
+    Sí si el nombre O la descripción hablan de carrozado/ambulancia/clínica móvil, o si
+    la línea es de vehículos motorizados (cualquier rubro3). Medido 14-09-2026: con el
+    prefiltro estricto, 607 de 617 adjudicaciones core de 2025 quedaron sin monto porque
+    la licitación no calificaba como core y sus ofertas nunca se cargaron. Cargar de más
+    cuesta unas 2.000 filas/mes; cargar de menos deja el análisis sin montos."""
+    txt = _norm(nombre) + " " + _norm(descripcion)
+    if _core_rx.search(txt):
+        return True
+    if _movil_rx.search(txt) and "movil" in txt:
+        return True
+    return _norm(rubro2).upper() == CORE_RUBRO2
 
 # RUTs objetivo (grupo + competidores) desde mp_competidores
 RUTS_NORM = set()
@@ -261,7 +275,8 @@ def procesar_mes(mes: str, zip_path: str):
     name = z.namelist()[0]
     log.info("  %s: abriendo %s (%s MB descomprimido)", mes, name, f"{z.getinfo(name).file_size / 1e6:,.0f}")
 
-    core_por_lic = {}            # codigo_externo -> bool (decidido con la primera fila)
+    core_por_lic = {}            # codigo_externo -> bool  es_core estricto (flag analítico)
+    cargar_por_lic = {}          # codigo_externo -> bool  red ancha: ¿guardar sus ofertas?
     # Los buffers son dicts por clave: PostgREST hace un solo INSERT ... ON CONFLICT y
     # Postgres rechaza dos filas con la misma clave en el mismo comando (error 21000).
     buf_l, buf_o = {}, {}        # codigo_externo -> fila | line_hash -> fila
@@ -292,21 +307,24 @@ def procesar_mes(mes: str, zip_path: str):
             if cod not in core_por_lic:
                 core = es_core(r.get("Nombre"), r.get("Descripcion"), r.get("Rubro2"), r.get("Rubro3"))
                 core_por_lic[cod] = core
+                cargar_por_lic[cod] = core or cargar_ofertas(r.get("Nombre"), r.get("Descripcion"), r.get("Rubro2"))
                 buf_l[cod] = parse_licitacion(r, mes, core)
                 if core:
                     n_core += 1
                     if len(ejemplos_core) < 5: ejemplos_core.append(f"{cod} · {(r.get('Nombre') or '')[:60]}")
                 if len(buf_l) >= 1000: flush_l()
             elif not core_por_lic[cod] and es_core(r.get("Nombre"), None, r.get("Rubro2"), r.get("Rubro3")):
-                core_por_lic[cod] = True; n_core += 1
+                core_por_lic[cod] = True; cargar_por_lic[cod] = True; n_core += 1
                 fila = parse_licitacion(r, mes, True)
                 if cod in buf_l: buf_l[cod] = fila          # aún no se envió: se reemplaza en el buffer
                 else:            promos[cod] = fila         # ya se envió: se re-upserta al final
+            elif not cargar_por_lic[cod] and _norm(r.get("Rubro2")).upper() == CORE_RUBRO2:
+                cargar_por_lic[cod] = True                  # una línea posterior es de vehículos
 
-            # Ofertas: licitación core o RUT objetivo ofertando
+            # Ofertas: licitación core / red ancha, o RUT objetivo ofertando
             es_comp = norm_rut(r.get("RutProveedor")) in RUTS_NORM
-            if core_por_lic[cod] or es_comp:
-                if es_comp and not core_por_lic[cod]: n_comp += 1
+            if cargar_por_lic[cod] or es_comp:
+                if es_comp and not cargar_por_lic[cod]: n_comp += 1
                 of = parse_oferta(r, mes)
                 buf_o[of["line_hash"]] = of
                 if len(buf_o) >= 1000:
@@ -323,8 +341,9 @@ def procesar_mes(mes: str, zip_path: str):
         log.info("  %s: %d cabeceras promovidas a core por rubro de una línea posterior", mes, len(promos))
     flush_o()
 
-    log.info("✅ %s: %s filas CSV → %s licitaciones (%s core, %s con competidor fuera del core), %s ofertas · %.0fs",
-             mes, f"{n_rows:,}", f"{len(core_por_lic):,}", n_core, n_comp, f"{n_o:,}", time.time() - t0)
+    n_cargar = sum(1 for v in cargar_por_lic.values() if v)
+    log.info("✅ %s: %s filas CSV → %s licitaciones (%s core estricto, %s con ofertas cargadas, %s sólo por competidor), %s ofertas · %.0fs",
+             mes, f"{n_rows:,}", f"{len(core_por_lic):,}", n_core, n_cargar, n_comp, f"{n_o:,}", time.time() - t0)
     for e in ejemplos_core: log.info("     core ej: %s", e)
 
     if SIN_CONSOLIDAR:
