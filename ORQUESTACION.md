@@ -34,6 +34,7 @@ Repo → Settings → Secrets and variables → Actions → **New repository sec
 | `mp-refetch-adjudicaciones.yml` | 03:00 | `refetch_adjudicaciones.py` |
 | `mp-backfill.yml` | 04:30 (≈00:30 CL) | `backfill_estados_lic.py` + `backfill_oc_detalle.py` |
 | `mp-oc-datos-abiertos.yml` | día 22, 06:00 | `ingesta_oc_datos_abiertos.py` |
+| `mp-lic-datos-abiertos.yml` | día 22, 06:30 | `ingesta_lic_datos_abiertos.py` (+ `fn_mp_da_consolidar`) |
 | `mp-odoo.yml` | cada 20 min L-V (pg_cron) | `sync_odoo_supabase.py` |
 | `mp-odoo-full.yml` | 1x/día L-V (pg_cron) | `sync_odoo_supabase.py` full |
 
@@ -97,6 +98,71 @@ la ingesta (`api_mu_x_cantidad`, exacto).
 `backfill_estados_lic.py` no alcanza a las licitaciones afectadas porque solo
 selecciona las que tienen `estado is null`. Para esas está
 `refetch_adjudicaciones.py`, que las direcciona explícitamente.
+
+
+### Licitaciones desde Datos Abiertos: la fuente histórica y la de las ofertas (sep-2026)
+
+Hasta septiembre de 2026 el universo de `mp_licitaciones` partía en **julio 2025**:
+`backfill_noche.py` (que recorre la API día por día hacia atrás) nunca se enganchó
+a un workflow y guardaba su checkpoint en un archivo local, así que murió con el
+Programador de Windows. Y los montos de `mp_adjudicaciones` tenían cobertura de
+**1,0 % en 2025** contra 58,5 % en 2026, sesgada además hacia el grupo (nuestras
+filas sí tenían monto; las de la competencia no). Cualquier share calculado sobre
+2025 era un artefacto.
+
+Los dos huecos se cierran con el mismo archivo mensual de Datos Abiertos, el
+hermano del que ya usamos para OC:
+
+```
+https://transparenciachc.blob.core.windows.net/lic-da/{AÑO}-{MES}.zip   (mes sin cero)
+```
+
+- Existe desde **2023-1** hasta el mes en curso; 14–26 MB zip, ~340 MB CSV, CP1252, `;`.
+- Indexado por **mes de publicación**. Marzo 2025 trae 8.484 licitaciones (el
+  espejo tenía 665 de ese mes).
+- **Una fila por oferta por línea**: todas las ofertas —perdedoras incluidas— con
+  `Valor Total Ofertado`, `Estado Oferta` (Aceptada/Rechazada = admisibilidad),
+  `Oferta seleccionada`, `MontoLineaAdjudica`, `NumeroOferentes`, región, rubros ONU.
+  Es lo que la API transaccional no entrega nunca.
+- Se **regenera**: el de 2025-3 tiene fecha 16-04-2026. Por eso el workflow recarga
+  siempre el mes vencido y los dos anteriores.
+- Límite conocido: sólo trae licitaciones con al menos una oferta. Las desiertas sin
+  oferentes no aparecen (~2 % del universo).
+
+`ingesta_lic_datos_abiertos.py` aterriza en dos tablas nuevas y luego consolida:
+
+| Tabla | Qué guarda | Volumen |
+|---|---|---|
+| `mp_da_licitaciones` | cabecera de TODAS las licitaciones del mes (denominador del universo) | ~8.500/mes |
+| `mp_da_ofertas` | ofertas por línea de las licitaciones **core** y de cualquier oferta de un RUT de `mp_competidores` | ~300–500/mes |
+
+`fn_mp_da_consolidar(mes)` lleva eso a las tablas canónicas **sin pisar nada que
+haya traído la API**: inserta las licitaciones/compradores/ítems que faltan,
+inserta las adjudicaciones seleccionadas que no están y rellena `monto_total`
+donde la API lo dejó en null (`monto_total_fuente = 'datos_abiertos'`). Ojo:
+`mp_licitaciones.monto_estimado` es una columna generada desde `raw->>'MontoEstimado'`,
+así que se escribe vía `raw` y como entero en texto.
+
+`v_mp_da_competencia` expone las ofertas con ranking de precio por línea y brecha
+contra el ganador — la base del termómetro real de Competencia.
+
+**Consecuencias para el resto del pipeline:**
+
+- `backfill_noche.py` queda **obsoleto** para licitaciones (sigue sirviendo su parte
+  de Compra Ágil y OC si alguien lo revive). No engancharlo.
+- `refetch_adjudicaciones.py` deja de ser necesario para el histórico; sigue útil
+  para el mes en curso, antes de que salga el archivo. Su scope `bti` ahora lee
+  `crm_projects.identificacion` además de `mp_tender_code` (740 → ~3.700 códigos).
+- Al comparar años: **jul-2025 en adelante** el universo viene de la API y de Datos
+  Abiertos a la vez (se deduplican por `codigo_externo`); **antes de jul-2025** viene
+  sólo de Datos Abiertos. La cobertura es homogénea desde 2023 una vez hecha la
+  carga inicial.
+- `mp_licitaciones_completo` y `v_mp_mercado_completo` están vacías y nunca se
+  llenaron: borrarlas o apuntar la vista a `mp_da_licitaciones`.
+
+**Carga inicial** (una vez, desde Actions → Run workflow):
+`meses = 2024-1,2024-2,…,2025-6`. Cada mes son 1–3 minutos; en dos tandas de
+nueve meses no se acerca al límite de 6 h.
 
 ## 3. Pasos para activar
 

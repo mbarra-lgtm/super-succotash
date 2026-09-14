@@ -102,14 +102,24 @@ def _sb_get(path, params):
 
 
 def _codigos_crm():
-    """Todos los códigos de licitación que el CRM registra para el grupo."""
-    rows = _sb_get("crm_projects", {
-        "select": "mp_tender_code",
-        "mp_tender_code": "not.is.null",
-        "is_active": "not.is.false",
-        "limit": "5000",
-    })
-    return sorted({r["mp_tender_code"].strip() for r in rows if (r.get("mp_tender_code") or "").strip()})
+    """Todos los códigos de licitación que el CRM registra para el grupo.
+
+    El código vive en crm_projects.identificacion (es lo que une v_mp_crm_licitacion);
+    mp_tender_code es un campo más antiguo con ~740 filas contra ~3.700 de
+    identificacion (medido 14-09-2026). Se leen los dos y se unen.
+    """
+    codigos = set()
+    for col in ("identificacion", "mp_tender_code"):
+        rows = _sb_get("crm_projects", {
+            "select": col,
+            col: "not.is.null",
+            "is_active": "not.is.false",
+            "limit": "10000",
+        })
+        codigos |= {(r.get(col) or "").strip() for r in rows if (r.get(col) or "").strip()}
+    # identificacion también guarda números de cotización (26.84DA, S00951...):
+    # sólo interesan los que parecen código de licitación MP (nnn-nn-XXnn).
+    return sorted(c for c in codigos if re.match(r"^\d+-\d+-[A-Z]{1,2}\d{2}", c))
 
 
 def _codigos_de_nuestras_oc():

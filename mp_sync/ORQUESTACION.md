@@ -34,6 +34,7 @@ Repo → Settings → Secrets and variables → Actions → **New repository sec
 | `mp-refetch-adjudicaciones.yml` | 03:00 | `refetch_adjudicaciones.py` |
 | `mp-backfill.yml` | 04:30 (≈00:30 CL) | `backfill_estados_lic.py` + `backfill_oc_detalle.py` |
 | `mp-oc-datos-abiertos.yml` | día 22, 06:00 | `ingesta_oc_datos_abiertos.py` |
+| `mp-lic-datos-abiertos.yml` | día 22, 06:30 | `ingesta_lic_datos_abiertos.py` — universo histórico + ofertas (ver ORQUESTACION.md raíz) |
 | `mp-odoo.yml` | cada 20 min L-V (pg_cron) | `sync_odoo_supabase.py` |
 | `mp-odoo-full.yml` | 1x/día L-V (pg_cron) | `sync_odoo_supabase.py` full |
 
