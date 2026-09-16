@@ -1,16 +1,31 @@
-name: MP · Adjuntos (listar, cada 2h)
+name: MP · Adjuntos (listar, nocturno)
 
 # Lista la METADATA de los anexos de las licitaciones priorizadas (las que
 # pegan con el Core de alguien, las marcadas interesa/quizás, y la cola manual
 # del panel). No descarga archivos: eso lo hace la Edge Function
 # mp-obtener-adjunto cuando alguien clickea un documento.
 #
-# Usa los mismos secrets que ya existen en el repo (SUPABASE_URL,
-# SUPABASE_SERVICE_KEY) — no hay que crear ninguno nuevo.
+# 16-09-2026 — pasó de cada 2 h a una corrida nocturna. Casi nadie lee estos
+# datos de forma directa (6 GET en 24 h), pero NO se apagó porque cinco vistas
+# dependen de estas tablas:
+#
+#   v_mp_adjuntos_pendientes        v_mp_seguimiento_panel
+#   v_mp_desenlace_panel            v_mp_seguimiento_no_adjudicadas
+#   v_mp_resoluciones_pendientes    ← es la cola del worker de Resoluciones
+#
+# Apagarlo del todo no rompe esas vistas, pero las deja sin anexos nuevos y al
+# worker de resoluciones sin trabajo. Una corrida nocturna cuesta casi lo mismo
+# que apagarlo y las mantiene alimentadas.
+#
+# Dimensionamiento: la cola manual está en 0 pendientes y hay ~900 licitaciones
+# ya procesadas (447 con anexos, 458 sin). Las 12 corridas diarias de 80 estaban
+# en su mayoría girando en vacío; 300 en una sola pasada sobra.
 
 on:
   schedule:
-    - cron: "35 */2 * * *"    # cada 2h, min :35 — detrás de licitaciones (:15) y CA (:05)
+    # 04:10 Chile. Los jobs del grupo mp-pesado terminan ~04:05 y el de OC Datos
+    # Abiertos arranca 05:00: esta es la ventana tranquila de la madrugada.
+    - cron: "10 7 * * *"
   workflow_dispatch:           # permite correrlo a mano desde la pestaña Actions
 
 concurrency:
@@ -20,14 +35,15 @@ concurrency:
 jobs:
   listar:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 30
     defaults:
       run:
         working-directory: mp_sync
     env:
       SUPABASE_URL:         ${{ secrets.SUPABASE_URL }}
       SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
-      ADJ_MAX_LIC_POR_RUN:  "80"     # listar es barato: 2 requests por licitación
+      # 300 × 2 requests × 2 s ≈ 20 min, holgado contra el timeout de 30.
+      ADJ_MAX_LIC_POR_RUN:  "300"    # listar es barato: 2 requests por licitación
       SLEEP_BETWEEN:        "2.0"    # la ficha de MP tira 429 igual que la API
     steps:
       - uses: actions/checkout@v4
