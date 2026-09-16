@@ -12,7 +12,7 @@ concurrency:
 jobs:
   sync:
     runs-on: ubuntu-latest
-    timeout-minutes: 30       # tope de seguridad: el cursor se guarda tras el listado
+    timeout-minutes: 30       # tope de seguridad: el cursor se guarda por trozo
     defaults:
       run:
         working-directory: mp_sync
@@ -23,6 +23,20 @@ jobs:
       CURSOR_BACKEND:       supabase
       SLEEP_BETWEEN:        "2.0"
       CA_VENTANA_HORAS:     "2"
+      # Una ventana = una sola página.
+      #
+      # Un trozo es atómico: se cierra (y guarda cursor) solo si TODAS sus
+      # páginas pasan. La API de MP está intermitente — el 16-09-2026 la página 1
+      # pasó al segundo intento y la 2 falló cinco veces seguidas — así que cada
+      # página extra multiplica la probabilidad de perder el trozo entero. Con el
+      # volumen real (~1.270 compras ágiles al día), 1 h de ventana son ~53 ítems
+      # y con páginas de 100 caben en una sola: el trozo cierra o no, sin cadena
+      # intermedia que romper.
+      #
+      # Si MP se estabiliza, subir CA_CHUNK_HORAS a 3 o 6 reduce el número de
+      # requests. Mientras esté intermitente, conviene dejarlo en 1.
+      CA_CHUNK_HORAS:       "1"
+      CA_PAGE_SIZE:         "100"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
