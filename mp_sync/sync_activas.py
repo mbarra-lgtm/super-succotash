@@ -53,6 +53,18 @@ MAX_POR_RUN  = int(os.getenv("LIC_MAX_POR_RUN", "100"))   # licitaciones por eje
 # Cupo maximo de la ventana que se reserva a licitaciones que aun no estan en BD.
 # Por defecto toda la ventana: una corrida puede ser 100% altas si hay atraso.
 MAX_NUEVAS   = int(os.getenv("LIC_MAX_NUEVAS", str(MAX_POR_RUN)))
+# Modo diurno: solo altas, sin refresco round-robin.
+#
+# Las dos mitades de este script tienen costos y valores muy distintos. Detectar
+# una licitacion nueva son pocas llamadas (hoy suele haber 0-2 pendientes) y es
+# lo que tiene valor comercial: una licitacion que se publica hay que verla el
+# mismo dia. El refresco de las ~4.500 activas son cientos de escrituras por
+# corrida y solo actualiza datos que ya tenemos.
+#
+# Con LIC_SOLO_NUEVAS=1 la corrida hace unicamente las altas. Asi el barrido
+# pesado se puede mover a la madrugada sin perder la deteccion temprana, que es
+# el motivo por el que este job corre cada hora.
+SOLO_NUEVAS  = os.getenv("LIC_SOLO_NUEVAS", "0").strip().lower() in ("1", "true", "si", "yes")
 # Codigos por request al prefetch de hashes. El filtro va en la URL (in.(...)),
 # asi que trocear evita pasarse del largo maximo con listados de miles.
 HASH_CHUNK   = int(os.getenv("LIC_HASH_CHUNK", "400"))
@@ -300,7 +312,10 @@ def main():
     set_nuevas   = set(tramo_nuevas)
 
     cursor = _load_cursor() % total
-    cupo   = max(0, MAX_POR_RUN - len(tramo_nuevas))
+    # En modo solo-altas el cupo de refresco es 0 y el cursor NO se mueve: la
+    # corrida nocturna lo retoma exactamente donde quedó, así el barrido no
+    # pierde posiciones por las corridas livianas del día.
+    cupo   = 0 if SOLO_NUEVAS else max(0, MAX_POR_RUN - len(tramo_nuevas))
     tramo_refresh, pos, avance = [], cursor, 0
     while len(tramo_refresh) < cupo and avance < total:
         codigo = todos[pos]
@@ -311,9 +326,10 @@ def main():
     nuevo_cursor = pos
 
     tramo = tramo_nuevas + tramo_refresh
-    log.info("Activas: %d total | %d sin ingestar (%d en esta corrida) | "
-             "refresco %d desde pos %d", total, len(nuevas_pend),
-             len(tramo_nuevas), len(tramo_refresh), cursor)
+    log.info("Activas [%s]: %d total | %d sin ingestar (%d en esta corrida) | "
+             "refresco %d desde pos %d",
+             "solo altas" if SOLO_NUEVAS else "altas + refresco",
+             total, len(nuevas_pend), len(tramo_nuevas), len(tramo_refresh), cursor)
 
     # 4. Procesar el tramo: inserta nuevas y re-lee abiertas modificadas
     ok = nuevas = actualizadas = sin_cambio = err = 0
