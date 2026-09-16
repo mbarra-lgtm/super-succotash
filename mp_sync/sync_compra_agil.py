@@ -43,7 +43,12 @@ SB_KEY       = os.environ["SUPABASE_SERVICE_KEY"]
 SB_REST      = f"{SUPABASE_URL}/rest/v1"
 
 SLEEP        = float(os.getenv("SLEEP_BETWEEN", "2.0"))
-PAGE_SIZE    = 50
+# Configurable a proposito. Un trozo es atomico: se cierra solo si TODAS sus
+# paginas pasan. Con la API de MP intermitente (16-09-2026: pagina 1 OK al
+# segundo intento, pagina 2 caida 5 veces seguidas), cada pagina extra multiplica
+# la probabilidad de que el trozo entero se pierda. Pagina grande + trozo chico =
+# una sola pagina por ventana = el trozo cierra o no, sin cadena que romper.
+PAGE_SIZE    = int(os.getenv("CA_PAGE_SIZE", "100"))
 CURSOR_FILE  = os.getenv("CA_CURSOR_FILE",
                os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cursor_ca.json"))
 VENTANA_HORAS = int(os.getenv("CA_VENTANA_HORAS", "1"))  # horas atrás si no hay cursor
