@@ -21,7 +21,7 @@ except ImportError:
 
 from sync_oc import (
     parse_oc_detalle, _fetch_detalle, _mp_get, _sb_upsert, _sb_delete,
-    _sb_headers, SB_REST, SLEEP, T_HDR, T_ITEMS,
+    _reemplazar_items, _sb_headers, SB_REST, SLEEP, T_HDR, T_ITEMS,
 )
 
 os.makedirs(os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs"), exist_ok=True)
@@ -35,6 +35,7 @@ log = logging.getLogger("backfill_oc_prov")
 # Grupo Bertonati + competidores: se leen de mp_competidores (maestro canonico).
 # OC_BACKFILL_RUTS sigue disponible para forzar una lista puntual.
 from competidores import ruts_objetivo
+import sb_client as sb
 
 _env = (os.getenv("OC_BACKFILL_RUTS") or "").strip()
 RUTS = ([r.strip() for r in _env.split(",") if r.strip()] if _env else ruts_objetivo())
@@ -42,17 +43,12 @@ MAX_DET = int(os.getenv("OC_PROV_MAX_DET", "3000"))   # tope de detalles por eje
 
 def _ya_con_detalle(codigos):
     """Set de códigos que ya tienen raw_hash (detalle) en BD."""
-    out = set()
-    for i in range(0, len(codigos), 100):
-        chunk = codigos[i:i+100]
-        r = requests.get(f"{SB_REST}/{T_HDR}", headers=_sb_headers(),
-                         params={"select": "codigo_oc,raw_hash",
-                                 "codigo_oc": f"in.({','.join(chunk)})",
-                                 "raw_hash": "not.is.null",
-                                 "limit": str(len(chunk)+1)}, timeout=30)
-        if r.ok:
-            out.update(row["codigo_oc"] for row in r.json())
-    return out
+    # El `if r.ok:` sin else hacía que un chunk fallido devolviera un set
+    # incompleto: OC que YA tenían detalle se volvían a pedir enteras a MP,
+    # gastando cuota y presupuesto de la corrida. select_in levanta.
+    filas = sb.select_in(T_HDR, "codigo_oc,raw_hash", "codigo_oc", codigos,
+                         chunk=100, extra={"raw_hash": "not.is.null"})
+    return {f["codigo_oc"] for f in filas}
 
 def main():
     log.info("=== backfill_oc_por_proveedor === %d RUTs | tope %d detalles/run", len(RUTS), MAX_DET)
@@ -82,10 +78,17 @@ def main():
                 oc = _fetch_detalle(cod); time.sleep(SLEEP)
                 if not oc: continue
                 hdr, items = parse_oc_detalle(oc)
+                # El raw_hash se estampa al final: es el testigo de "cabecera +
+                # items escritos", y este backfill salta las OC que ya lo tienen.
+                # Escribirlo junto con la cabecera y fallar en los items dejaba
+                # la OC marcada como completa para siempre, con items a medias.
+                nuevo_hash = hdr.pop("raw_hash", None)
                 _sb_upsert(T_HDR, "codigo_oc", [hdr])
                 if items:
-                    _sb_delete(T_ITEMS, "codigo_oc", cod)
-                    _sb_upsert(T_ITEMS, "codigo_oc,line_no", items)
+                    _reemplazar_items(cod, items)
+                if nuevo_hash:
+                    _sb_upsert(T_HDR, "codigo_oc",
+                               [{"codigo_oc": cod, "raw_hash": nuevo_hash}])
                 tot_ok += 1; presupuesto -= 1
             except Exception as e:
                 log.warning("✗ %s: %s", cod, repr(e)); tot_err += 1
@@ -94,16 +97,9 @@ def main():
 
     # Latido de frescura: sin esto nadie se entera si el barrido se cae. Es el job
     # que garantiza las OC del grupo, asi que su silencio tiene que ser detectable.
-    try:
-        from datetime import timezone
-        _sb_upsert("data_freshness", "dataset", [{
-            "dataset":      "mp_oc_proveedor",
-            "refreshed_at": datetime.now(timezone.utc).isoformat(),
-            "rows_changed": tot_ok,
-            "source":       "backfill_oc_por_proveedor.py",
-        }])
-    except Exception as e:
-        log.warning("No pude estampar data_freshness: %s", repr(e))
+    # No estampa si la corrida tuvo fallos de escritura.
+    sb.stamp_freshness("mp_oc_proveedor", tot_ok, "backfill_oc_por_proveedor.py")
+    sb.exit_si_hubo_fallos()
 
 if __name__ == "__main__":
     main()

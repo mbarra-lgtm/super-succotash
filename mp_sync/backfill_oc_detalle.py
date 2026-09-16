@@ -21,9 +21,10 @@ except ImportError:
     pass
 
 from sync_oc import (
-    parse_oc_detalle, _fetch_detalle, _sb_upsert, _sb_delete,
+    parse_oc_detalle, _fetch_detalle, _sb_upsert, _sb_delete, _reemplazar_items,
     _sb_headers, SB_REST, SLEEP, T_HDR, T_ITEMS,
 )
+import sb_client as sb
 
 # La carpeta de logs debe existir ANTES de configurar el FileHandler
 os.makedirs(os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs"), exist_ok=True)
@@ -86,10 +87,16 @@ def main():
                 sin_det += 1
                 continue
             hdr, items = parse_oc_detalle(oc)
+            # raw_hash al final: es el testigo de "cabecera + items escritos" y
+            # este backfill selecciona justamente por raw_hash null. Estamparlo
+            # antes de los items sacaba la OC del conjunto pendiente con los
+            # items incompletos, sin forma de volver a ella.
+            nuevo_hash = hdr.pop("raw_hash", None)
             _sb_upsert(T_HDR, "codigo_oc", [hdr])
             if items:
-                _sb_delete(T_ITEMS, "codigo_oc", cod)
-                _sb_upsert(T_ITEMS, "codigo_oc,line_no", items)
+                _reemplazar_items(cod, items)
+            if nuevo_hash:
+                _sb_upsert(T_HDR, "codigo_oc", [{"codigo_oc": cod, "raw_hash": nuevo_hash}])
             ok += 1
             if i % 100 == 0:
                 log.info("  [%d/%d] último: %s", i, len(pendientes), cod)
@@ -98,6 +105,8 @@ def main():
             err += 1
 
     log.info("=== Lote terminado: ok=%d sin_detalle=%d err=%d ===", ok, sin_det, err)
+
+    sb.exit_si_hubo_fallos()
 
 if __name__ == "__main__":
     main()

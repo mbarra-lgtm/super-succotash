@@ -18,6 +18,9 @@ try:
 except ImportError:
     pass
 
+# Después de load_dotenv: sb_client lee las credenciales al importarse.
+import sb_client as sb
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -62,41 +65,42 @@ def _sb_headers():
         "Prefer": "resolution=merge-duplicates,return=minimal"
     }
 
-def _sb_upsert(table: str, on_conflict: str, rows: list):
-    if not rows: return
-    r = requests.post(
-        f"{SB_REST}/{table}", headers=_sb_headers(),
-        params={"on_conflict": on_conflict} if on_conflict else {},
-        json=rows, timeout=60
-    )
-    if not r.ok:
-        log.error("SB %s error: %s", table, r.text[:300])
+_sb_upsert = sb.upsert
 
 def _sb_exists_bulk(codigos: list) -> set:
-    """Retorna set de códigos que YA existen en mp_licitaciones."""
-    if not codigos: return set()
-    # Supabase REST limita el IN a 100 items — chunking
-    existentes = set()
-    chunk_size = 100
-    for i in range(0, len(codigos), chunk_size):
-        chunk = codigos[i:i+chunk_size]
-        r = requests.get(
-            f"{SB_REST}/{T_LIC}", headers=_sb_headers(),
-            params={
-                "select": "codigo_externo",
-                "codigo_externo": f"in.({','.join(chunk)})",
-                "limit": str(len(chunk) + 1)
-            }, timeout=30
-        )
-        if r.ok:
-            existentes.update(row["codigo_externo"] for row in r.json())
-    return existentes
+    """Retorna set de códigos que YA existen en mp_licitaciones.
+
+    El `if r.ok:` sin else que había acá era un fallo silencioso con dientes: un
+    chunk que fallaba se saltaba sin ruido y el set volvía incompleto, así que
+    licitaciones que SÍ estaban en BD se trataban como inexistentes. Ahora un
+    chunk que no se puede leer aborta la corrida en vez de devolver una respuesta
+    a medias.
+    """
+    filas = sb.select_in(T_LIC, "codigo_externo", "codigo_externo", codigos, chunk=100)
+    return {f["codigo_externo"] for f in filas}
 
 def _sb_delete_adj(licitacion_id: str):
-    requests.delete(
-        f"{SB_REST}/{T_ADJ}", headers=_sb_headers(),
-        params={"licitacion_id": f"eq.{licitacion_id}"}, timeout=30
-    )
+    sb.delete(T_ADJ, {"licitacion_id": f"eq.{licitacion_id}"})
+
+def _reemplazar_adj(licitacion_id: str, adj_rows: list):
+    """Deja en BD exactamente las adjudicaciones recién leídas.
+
+    Antes se borraba todo y después se insertaba: si el insert fallaba, esa
+    licitación quedaba sin adjudicaciones y nada las reponía. Ahora se escribe
+    primero y sólo después se borran las que sobraron, así que en ningún momento
+    la licitación queda vacía. Las bajas reales (una adjudicación que MP eliminó)
+    siguen propagándose, que es para lo que existía el delete.
+    """
+    previas = sb.select(T_ADJ, {"select": "item_no,proveedor_rut",
+                                "licitacion_id": f"eq.{licitacion_id}"})
+    sb.upsert(T_ADJ, "licitacion_id,item_no,proveedor_rut", adj_rows)
+
+    vivas = {(str(r.get("item_no")), str(r.get("proveedor_rut"))) for r in adj_rows}
+    for p in previas:
+        if (str(p.get("item_no")), str(p.get("proveedor_rut"))) not in vivas:
+            sb.delete(T_ADJ, {"licitacion_id": f"eq.{licitacion_id}",
+                              "item_no": f"eq.{p['item_no']}",
+                              "proveedor_rut": f"eq.{p['proveedor_rut']}"})
 
 # ── Parsers ─────────────────────────────────────────────────────────────────
 def _ts(v) -> Optional[str]:
@@ -230,8 +234,7 @@ def main():
 
             # Reemplazar adjudicaciones si las hay
             if adj_rows:
-                _sb_delete_adj(codigo)
-                _sb_upsert(T_ADJ, "licitacion_id,item_no,proveedor_rut", adj_rows)
+                _reemplazar_adj(codigo, adj_rows)
 
             log.info("✓ %s → %s (%d adj)", codigo, estado_row["estado"], len(adj_rows))
             ok += 1
@@ -241,6 +244,9 @@ def main():
             err += 1
 
     log.info("=== Resultado: ok=%d sin_cambio=%d err=%d ===", ok, sin_cambio, err)
+
+    # Rojo si se perdió alguna escritura hacia Supabase.
+    sb.exit_si_hubo_fallos()
 
 if __name__ == "__main__":
     main()

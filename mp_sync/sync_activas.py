@@ -33,6 +33,8 @@ except ImportError:
     pass
 
 from cursor_store import load_cursor, save_cursor
+# Después de load_dotenv: sb_client lee las credenciales al importarse.
+import sb_client as sb
 
 logging.basicConfig(level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -102,18 +104,10 @@ def _sb_headers():
             "Content-Type": "application/json",
             "Prefer": "resolution=merge-duplicates,return=minimal"}
 
-def _sb_upsert(table, on_conflict, rows):
-    if not rows: return
-    url = f"{SB_REST}/{table}"
-    r = requests.post(url, headers=_sb_headers(),
-                      params={"on_conflict": on_conflict} if on_conflict else {},
-                      json=rows, timeout=60)
-    if not r.ok:
-        log.error("Supabase %s error: %s", table, r.text[:200])
+_sb_upsert = sb.upsert
 
 def _sb_delete(table, col, val):
-    requests.delete(f"{SB_REST}/{table}", headers=_sb_headers(),
-                    params={col: f"eq.{val}"}, timeout=30)
+    sb.delete(table, {col: f"eq.{val}"})
 
 def _sb_hashes_bulk(codigos: list) -> dict:
     """Retorna dict codigo_externo -> raw_hash de las que ya existen en BD.
@@ -121,23 +115,34 @@ def _sb_hashes_bulk(codigos: list) -> dict:
     Trocea en lotes de HASH_CHUNK: el filtro viaja en la URL y con listados de
     miles de codigos un solo request se pasa del largo maximo y vuelve vacio,
     lo que haria ver TODAS las licitaciones como nuevas.
+
+    Un lote que no se puede leer aborta el prefetch entero (select_in levanta):
+    devolver un dict incompleto marcaria como "nuevas" licitaciones que si
+    estan. Lo que cambia respecto de antes es que ahora reintenta 5 veces con
+    backoff antes de rendirse — el 16-09-2026 un 522 pasajero tumbaba la corrida
+    al primer intento.
     """
-    if not codigos: return {}
-    out = {}
-    for i in range(0, len(codigos), HASH_CHUNK):
-        lote = codigos[i:i + HASH_CHUNK]
-        r = requests.get(f"{SB_REST}/{T_LIC}", headers=_sb_headers(),
-                         params={"select": "codigo_externo,raw_hash",
-                                 "codigo_externo": f"in.({','.join(lote)})",
-                                 "limit": str(len(lote)+1)}, timeout=30)
-        if not r.ok:
-            # Falla parcial: se aborta el prefetch entero. Devolver un dict
-            # incompleto marcaria como "nuevas" licitaciones que si estan.
-            raise RuntimeError(f"prefetch de hashes fallo ({r.status_code}): {r.text[:150]}")
-        for row in r.json():
-            if row.get("codigo_externo"):
-                out[row["codigo_externo"]] = row.get("raw_hash")
-    return out
+    filas = sb.select_in(T_LIC, "codigo_externo,raw_hash",
+                         "codigo_externo", codigos, chunk=HASH_CHUNK)
+    return {f["codigo_externo"]: f.get("raw_hash")
+            for f in filas if f.get("codigo_externo")}
+
+def _reemplazar_adj(codigo: str, adj_rows: list):
+    """Deja en BD exactamente las adjudicaciones recién leídas.
+
+    Escribe primero y borra después sólo lo que sobró, para que la licitación
+    nunca quede sin adjudicaciones si una de las dos operaciones falla.
+    """
+    previas = sb.select(T_ADJ, {"select": "item_no,proveedor_rut",
+                                "licitacion_id": f"eq.{codigo}"})
+    sb.upsert(T_ADJ, "licitacion_id,item_no,proveedor_rut", adj_rows)
+
+    vivas = {(str(r.get("item_no")), str(r.get("proveedor_rut"))) for r in adj_rows}
+    for p in previas:
+        if (str(p.get("item_no")), str(p.get("proveedor_rut"))) not in vivas:
+            sb.delete(T_ADJ, {"licitacion_id": f"eq.{codigo}",
+                              "item_no": f"eq.{p['item_no']}",
+                              "proveedor_rut": f"eq.{p['proveedor_rut']}"})
 
 # ── Cursor (persistido en Supabase: mp_sync_cursor, key="activas") ───
 def _load_cursor() -> int:
@@ -339,7 +344,7 @@ def main():
             _sb_upsert(T_COMP,   "codigo_externo", [comp_row])
             _sb_upsert(T_FECHAS, "codigo_externo", [fechas_row])
             if item_rows: _sb_upsert(T_ITEMS, "codigo_externo,correlativo", item_rows)
-            if adj_rows:  _sb_upsert(T_ADJ, "licitacion_id,item_no,proveedor_rut", adj_rows)
+            if adj_rows:  _reemplazar_adj(codigo, adj_rows)
             _sb_upsert(T_LIC, "codigo_externo",
                        [{"codigo_externo": codigo, "raw_hash": nuevo_hash}])
 
@@ -370,6 +375,10 @@ def main():
              max(0, len(nuevas_pend) - nuevas))
     if corte_cuota:
         sys.exit(1)
+
+    # Rojo también si se perdió alguna escritura hacia Supabase, no sólo por
+    # cuota de MP: una corrida que no escribió nada no puede quedar en verde.
+    sb.exit_si_hubo_fallos()
 
 if __name__ == "__main__":
     main()

@@ -21,6 +21,8 @@ except ImportError:
     pass
 
 from cursor_store import load_cursor, save_cursor
+# Después de load_dotenv: sb_client lee las credenciales al importarse.
+import sb_client as sb
 
 # La carpeta de logs debe existir ANTES de configurar el FileHandler
 os.makedirs(os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs"), exist_ok=True)
@@ -83,28 +85,32 @@ def _sb_headers():
         "Prefer": "resolution=merge-duplicates,return=minimal"
     }
 
-def _sb_upsert(table: str, on_conflict: str, rows: list):
-    if not rows: return
-    r = requests.post(
-        f"{SB_REST}/{table}", headers=_sb_headers(),
-        params={"on_conflict": on_conflict} if on_conflict else {},
-        json=rows, timeout=60
-    )
-    if not r.ok:
-        log.error("SB %s error: %s", table, r.text[:300])
+_sb_upsert = sb.upsert
 
 def _sb_delete_adj(licitacion_id: str):
-    requests.delete(
-        f"{SB_REST}/{T_ADJ}", headers=_sb_headers(),
-        params={"licitacion_id": f"eq.{licitacion_id}"}, timeout=30
-    )
+    sb.delete(T_ADJ, {"licitacion_id": f"eq.{licitacion_id}"})
+
+def _reemplazar_adj(licitacion_id: str, adj_rows: list):
+    """Escribe las adjudicaciones y recién después borra las que sobraron."""
+    previas = sb.select(T_ADJ, {"select": "item_no,proveedor_rut",
+                                "licitacion_id": f"eq.{licitacion_id}"})
+    sb.upsert(T_ADJ, "licitacion_id,item_no,proveedor_rut", adj_rows)
+
+    vivas = {(str(r.get("item_no")), str(r.get("proveedor_rut"))) for r in adj_rows}
+    for p in previas:
+        if (str(p.get("item_no")), str(p.get("proveedor_rut"))) not in vivas:
+            sb.delete(T_ADJ, {"licitacion_id": f"eq.{licitacion_id}",
+                              "item_no": f"eq.{p['item_no']}",
+                              "proveedor_rut": f"eq.{p['proveedor_rut']}"})
 
 # ── Cursor ──────────────────────────────────────────────────────────────────
 def _load_cursor() -> dict:
     try:
         data = load_cursor("backfill_estados", {})
         if data: return data
-    except: pass
+    except Exception as e:
+        # `except:` a secas atrapaba también KeyboardInterrupt y SystemExit.
+        log.warning("Cursor ilegible (%r) — se empieza de cero", e)
     return {"offset": 0, "procesadas": 0, "ok": 0, "err": 0, "sin_detalle": 0}
 
 def _save_cursor(state: dict):
@@ -205,22 +211,17 @@ def _get_pendientes(limit: int) -> list:
     adjudicada el 01-04-2026). Se reintenta pasados REINTENTO_DIAS.
     """
     corte = (datetime.now(timezone.utc) - timedelta(days=REINTENTO_DIAS)).isoformat()
-    r = requests.get(
-        f"{SB_REST}/{T_LIC}", headers=_sb_headers(),
-        params={
-            "select":               "codigo_externo,fecha_cierre",
-            "codigo_estado":         "eq.5",
-            "estado":                "is.null",
-            "or":                    f"(last_detail_fetch_at.is.null,last_detail_fetch_at.lt.{corte})",
-            "fecha_cierre":          "lt.now()",
-            "order":                 "fecha_cierre.asc",
-            "limit":                 str(limit),
-        }, timeout=30
-    )
-    if not r.ok:
-        # Un 500 de PostgREST devolvia [] y el main lo leia como "no hay pendientes".
-        raise RuntimeError(f"PostgREST {r.status_code}: {r.text[:200]}")
-    return r.json()
+    # sb.select levanta ante error en vez de devolver []: un 500 de PostgREST se
+    # leia como "no hay pendientes" y el backfill terminaba en verde sin hacer nada.
+    return sb.select(T_LIC, {
+        "select":               "codigo_externo,fecha_cierre",
+        "codigo_estado":         "eq.5",
+        "estado":                "is.null",
+        "or":                    f"(last_detail_fetch_at.is.null,last_detail_fetch_at.lt.{corte})",
+        "fecha_cierre":          "lt.now()",
+        "order":                 "fecha_cierre.asc",
+        "limit":                 str(limit),
+    })
 
 # ── Main ────────────────────────────────────────────────────────────────────
 def main():
@@ -261,8 +262,7 @@ def main():
             estado_row, adj_rows = _parse_detalle(lics[0])
             _sb_upsert(T_LIC, "codigo_externo", [estado_row])
             if adj_rows:
-                _sb_delete_adj(codigo)
-                _sb_upsert(T_ADJ, "licitacion_id,item_no,proveedor_rut", adj_rows)
+                _reemplazar_adj(codigo, adj_rows)
 
             if i % 50 == 0:
                 log.info("  [%d/%d] Último: %s → %s (%d adj)",
@@ -286,6 +286,11 @@ def main():
     log.info("=== Lote terminado: ok=%d sin_detalle=%d err=%d | Total acumulado: %d/%d ===",
              ok, sin_detalle, err, state["procesadas"],
              state["procesadas"] + max(0, 37267 - state["offset"]))
+
+    # Nota: "offset" acá es contabilidad, no un cursor de paginación — _pendientes()
+    # filtra por estado is null, así que el lote se auto-drena a medida que se
+    # escribe. Lo que sí importa es no terminar en verde si se perdió una escritura.
+    sb.exit_si_hubo_fallos()
 
 if __name__ == "__main__":
     main()

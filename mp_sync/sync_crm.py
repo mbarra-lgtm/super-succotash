@@ -26,6 +26,9 @@ try:
 except ImportError:
     pass
 
+# Después de load_dotenv: sb_client lee las credenciales al importarse.
+import sb_client as sb
+
 logging.basicConfig(level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S")
@@ -72,22 +75,23 @@ def _sb_headers():
             "Prefer": "resolution=merge-duplicates,return=minimal"}
 
 def _sb_get(table, filters={}, select="*", limit=5000):
+    """Antes devolvía [] ante error, lo que se leía como 'no hay datos'."""
     params = {k: f"eq.{v}" for k, v in filters.items()}
     params.update({"select": select, "limit": str(limit)})
-    r = requests.get(f"{SB_REST}/{table}", headers=_sb_headers(), params=params, timeout=30)
-    return r.json() if r.ok else []
+    return sb.select(table, params)
 
 def _sb_get_paginado(table, select, params=None, page=PAGE, tope=20000):
-    """GET a PostgREST paginado por offset. Devuelve todas las filas."""
+    """GET a PostgREST paginado por offset. Devuelve todas las filas.
+
+    El `break` ante error devolvía las páginas leídas hasta ahí como si fueran el
+    conjunto completo: el llamador veía menos oportunidades de CRM de las que hay
+    y las que faltaban simplemente no se sincronizaban. Ahora un error levanta.
+    """
     filas, offset = [], 0
     while offset < tope:
         q = dict(params or {})
         q.update({"select": select, "limit": str(page), "offset": str(offset)})
-        r = requests.get(f"{SB_REST}/{table}", headers=_sb_headers(), params=q, timeout=60)
-        if not r.ok:
-            log.error("SB %s: %s", table, r.text[:200])
-            break
-        lote = r.json() or []
+        lote = sb.select(table, q) or []
         filas.extend(lote)
         if len(lote) < page:
             break
@@ -128,16 +132,34 @@ def _leer_candidatos_crm():
     return candidatos
 
 
-def _sb_upsert(table, on_conflict, rows):
-    if not rows: return
-    r = requests.post(f"{SB_REST}/{table}", headers=_sb_headers(),
-                      params={"on_conflict": on_conflict} if on_conflict else {},
-                      json=rows, timeout=60)
-    if not r.ok: log.error("SB %s: %s", table, r.text[:200])
+_sb_upsert = sb.upsert
 
 def _sb_delete(table, col, val):
-    requests.delete(f"{SB_REST}/{table}", headers=_sb_headers(),
-                    params={col: f"eq.{val}"}, timeout=30)
+    sb.delete(table, {col: f"eq.{val}"})
+
+def _limpiar_sobrantes(codigo, item_rows, adj_rows):
+    """Borra items y adjudicaciones que ya no vienen en el detalle de MP.
+
+    Se llama DESPUÉS de escribir, no antes: así, si el upsert falla, la
+    licitación conserva lo que tenía en vez de quedar vacía. Las bajas reales
+    (un item que MP eliminó) se siguen propagando, que es para lo que existía el
+    borrado original.
+    """
+    vivos = [str(r["item_no"]) for r in item_rows]
+    if vivos:
+        sb.delete(T_ITEMS, {"codigo_externo": f"eq.{codigo}",
+                            "item_no": f"not.in.({','.join(vivos)})"})
+    else:
+        sb.delete(T_ITEMS, {"codigo_externo": f"eq.{codigo}"})
+
+    previas = sb.select(T_ADJ, {"select": "item_no,proveedor_rut",
+                                "codigo_externo": f"eq.{codigo}"})
+    vivas = {(str(r.get("item_no")), str(r.get("proveedor_rut"))) for r in adj_rows}
+    for p in previas:
+        if (str(p.get("item_no")), str(p.get("proveedor_rut"))) not in vivas:
+            sb.delete(T_ADJ, {"codigo_externo": f"eq.{codigo}",
+                              "item_no": f"eq.{p['item_no']}",
+                              "proveedor_rut": f"eq.{p['proveedor_rut']}"})
 
 def _hash(obj):
     return hashlib.md5(json.dumps(obj, sort_keys=True, default=str).encode()).hexdigest()
@@ -265,10 +287,9 @@ def main():
             _upsert_espejo_canonico(codigo, lic, raw_h)
             espejo += 1
 
-            # Items y adjudicaciones
-            _sb_delete(T_ITEMS, "codigo_externo", codigo)
-            _sb_delete(T_ADJ,   "codigo_externo", codigo)
-
+            # Items y adjudicaciones. El borrado va DESPUÉS del upsert (ver
+            # _limpiar_sobrantes): borrar primero y fallar al escribir dejaba la
+            # licitación sin items ni adjudicaciones, y nada las reponía.
             item_rows, adj_rows = [], []
             seen_i, seen_a = set(), set()
             for it in items:
@@ -300,6 +321,7 @@ def main():
 
             if item_rows: _sb_upsert(T_ITEMS, "codigo_externo,item_no", item_rows)
             if adj_rows:  _sb_upsert(T_ADJ, "codigo_externo,item_no,proveedor_rut", adj_rows)
+            _limpiar_sobrantes(codigo, item_rows, adj_rows)
             log.info("Actualizado: %s | estado=%s", codigo, lic.get("Estado"))
             ok += 1
 
@@ -309,6 +331,9 @@ def main():
 
     log.info("Resultado: ok=%d skip=%d err=%d | espejo mp_licitaciones=%d",
              ok, skip, err, espejo)
+
+    # Rojo si se perdió alguna escritura hacia Supabase.
+    sb.exit_si_hubo_fallos()
 
 if __name__ == "__main__":
     main()

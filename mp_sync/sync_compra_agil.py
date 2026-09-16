@@ -27,6 +27,8 @@ except ImportError:
     pass
 
 from cursor_store import load_cursor, save_cursor
+# Después de load_dotenv: sb_client lee las credenciales al importarse.
+import sb_client as sb
 
 logging.basicConfig(level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -61,9 +63,8 @@ CHUNK_HORAS   = float(os.getenv("CA_CHUNK_HORAS", "6"))
 PRESUP_LISTADO_S = float(os.getenv("CA_PRESUP_LISTADO_S", "1200"))   # 20 min
 PRESUP_DETALLE_S = float(os.getenv("CA_PRESUP_DETALLE_S", "420"))    # 7 min
 MAX_DETALLE      = int(os.getenv("CA_MAX_DETALLE", "300"))
-# Reintentos hacia MP y hacia Supabase
+# Reintentos hacia MP (los de Supabase los maneja sb_client)
 MP_INTENTOS  = int(os.getenv("CA_MP_INTENTOS", "5"))
-SB_INTENTOS  = int(os.getenv("CA_SB_INTENTOS", "4"))
 
 ESTADOS_DETALLE = {"cerrada", "desierta", "cancelada", "proveedor_seleccionado"}
 
@@ -119,47 +120,13 @@ def _sb_headers():
             "Content-Type": "application/json",
             "Prefer": "resolution=merge-duplicates,return=minimal"}
 
-def _sb_request(metodo, table, **kw):
-    """Llamada a Supabase con reintentos ante 429/5xx; levanta si no se logra.
-
-    Una escritura que solo se loguea deja al cursor avanzar sobre datos que nunca
-    entraron: la ventana no se vuelve a consultar y el hueco es permanente.
-    """
-    ultimo = None
-    for intento in range(SB_INTENTOS):
-        try:
-            r = requests.request(metodo, f"{SB_REST}/{table}",
-                                 headers=_sb_headers(), timeout=60, **kw)
-        except requests.RequestException as e:
-            ultimo = repr(e)
-        else:
-            if r.ok:
-                return r
-            ultimo = f"{r.status_code}: {r.text[:200]}"
-            if 400 <= r.status_code < 500 and r.status_code != 429:
-                # Payload o esquema mal: reintentar no cambia nada.
-                raise RuntimeError(f"SB {metodo} {table} — {ultimo}")
-
-        if intento < SB_INTENTOS - 1:
-            espera = min(60.0, (2 ** intento) * 5) + random.uniform(0, 3)
-            log.warning("SB %s %s (%s) — reintento %d/%d en %.0fs",
-                        metodo, table, ultimo, intento + 1, SB_INTENTOS - 1, espera)
-            time.sleep(espera)
-
-    raise RuntimeError(f"SB {metodo} {table} falló tras {SB_INTENTOS} intentos — {ultimo}")
-
-def _sb_upsert(table, on_conflict, rows):
-    if not rows: return
-    _sb_request("POST", table,
-                params={"on_conflict": on_conflict} if on_conflict else {},
-                json=rows)
+_sb_upsert = sb.upsert
 
 def _sb_delete(table, id_mp):
-    _sb_request("DELETE", table, params={"id_mp": f"eq.{id_mp}"})
+    sb.delete(table, {"id_mp": f"eq.{id_mp}"})
 
 def _sb_select(table, id_mp):
-    return _sb_request("GET", table,
-                       params={"select": "*", "id_mp": f"eq.{id_mp}"}).json()
+    return sb.select(table, {"select": "*", "id_mp": f"eq.{id_mp}"})
 
 def _sb_con_detalle(ids: list) -> set:
     """IDs que ya tienen detalle sincronizado, en bloque.
@@ -167,19 +134,11 @@ def _sb_con_detalle(ids: list) -> set:
     Reemplaza un SELECT por item: con un atraso de miles de compras ágiles, esa
     consulta uno-a-uno era la mitad del costo de la fase de detalles.
     """
-    if not ids: return set()
-    out = set()
-    for i in range(0, len(ids), 100):
-        lote = ids[i:i + 100]
-        filas = _sb_request("GET", T_MAIN, params={
-            "select": "id_mp",
-            "id_mp": f"in.({','.join(lote)})",
-            "detail_synced_at": "not.is.null",
-            "id_orden_compra": "not.is.null",
-            "limit": str(len(lote) + 1),
-        }).json()
-        out.update(f["id_mp"] for f in filas)
-    return out
+    filas = sb.select_in(T_MAIN, "id_mp", "id_mp", ids, chunk=100, extra={
+        "detail_synced_at": "not.is.null",
+        "id_orden_compra": "not.is.null",
+    })
+    return {f["id_mp"] for f in filas}
 
 # ── Cursor (persistido en Supabase: mp_sync_cursor, key="compra_agil") ──
 def _fmt(dt: datetime) -> str:
@@ -392,6 +351,7 @@ def main():
     if trozos == 0 and corte:
         log.error("Ningún trozo cerrado en esta corrida.")
         sys.exit(1)
+    sb.exit_si_hubo_fallos()
     if errores_detalle:
         log.warning("%d detalles con error (se reintentan solos la próxima corrida)",
                     errores_detalle)

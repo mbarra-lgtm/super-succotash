@@ -19,6 +19,9 @@ try:
 except ImportError:
     pass
 
+# Después de load_dotenv: sb_client lee las credenciales al importarse.
+import sb_client as sb
+
 logging.basicConfig(level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S")
@@ -68,31 +71,50 @@ def _sb_headers():
             "Content-Type": "application/json",
             "Prefer": "resolution=merge-duplicates,return=minimal"}
 
-def _sb_upsert(table, on_conflict, rows):
-    if not rows: return
-    for i in range(0, len(rows), 500):
-        chunk = rows[i:i+500]
-        r = requests.post(f"{SB_REST}/{table}", headers=_sb_headers(),
-                          params={"on_conflict": on_conflict} if on_conflict else {},
-                          json=chunk, timeout=60)
-        if not r.ok: log.error("SB %s: %s", table, r.text[:200])
+# sb.upsert ya trocea en lotes de SB_CHUNK_FILAS (500 por defecto).
+_sb_upsert = sb.upsert
 
 def _sb_select_pending(table, null_col, extra={}, select="*", limit=100):
+    """Antes devolvía [] ante error: "la base no responde" se leía como "no hay
+    pendientes" y el backfill terminaba en verde sin haber hecho nada."""
     params = {null_col: "is.null", "select": select, "limit": str(limit)}
     params.update({k: f"eq.{v}" for k, v in extra.items()})
-    r = requests.get(f"{SB_REST}/{table}", headers=_sb_headers(), params=params, timeout=30)
-    return r.json() if r.ok else []
+    return sb.select(table, params)
 
 def _sb_delete(table, col, val):
-    requests.delete(f"{SB_REST}/{table}", headers=_sb_headers(),
-                    params={col: f"eq.{val}"}, timeout=30)
+    sb.delete(table, {col: f"eq.{val}"})
+
+def _reemplazar_hijos(codigo, item_rows, adj_rows):
+    """Escribe items y adjudicaciones, y recién después borra lo que sobró.
+
+    Borrar primero y fallar al escribir dejaba la licitación sin hijos, sin nada
+    que los repusiera.
+    """
+    if item_rows:
+        sb.upsert("mp_licitacion_items", "codigo_externo,correlativo", item_rows)
+        vivos = [str(r["correlativo"]) for r in item_rows]
+        sb.delete("mp_licitacion_items", {"codigo_externo": f"eq.{codigo}",
+                                          "correlativo": f"not.in.({','.join(vivos)})"})
+    if adj_rows:
+        previas = sb.select("mp_adjudicaciones",
+                            {"select": "item_no,proveedor_rut",
+                             "licitacion_id": f"eq.{codigo}"})
+        sb.upsert("mp_adjudicaciones", "licitacion_id,item_no,proveedor_rut", adj_rows)
+        vivas = {(str(r.get("item_no")), str(r.get("proveedor_rut"))) for r in adj_rows}
+        for p in previas:
+            if (str(p.get("item_no")), str(p.get("proveedor_rut"))) not in vivas:
+                sb.delete("mp_adjudicaciones",
+                          {"licitacion_id": f"eq.{codigo}",
+                           "item_no": f"eq.{p['item_no']}",
+                           "proveedor_rut": f"eq.{p['proveedor_rut']}"})
 
 # ── Checkpoint ───────────────────────────────
 def _load_checkpoint():
     try:
         if os.path.exists(CHECKPOINT_FILE):
             return json.loads(open(CHECKPOINT_FILE).read())
-    except: pass
+    except Exception as e:
+        log.warning('Checkpoint ilegible (%r) — se empieza de cero', e)
     return {}
 
 def _save_checkpoint(data):
@@ -236,15 +258,11 @@ def backfill_licitaciones():
                                 "monto_total":     mt,
                                 "monto_total_fuente": fuente,
                             })
-                    # DELETE solo si hay algo con que reemplazar: si el detalle vino
-                    # sin items (respuesta parcial de la API), el delete incondicional
-                    # borraba filas buenas y no las reponia.
-                    if item_rows:
-                        _sb_delete("mp_licitacion_items", "codigo_externo", codigo)
-                        _sb_upsert("mp_licitacion_items", "codigo_externo,correlativo", item_rows)
-                    if adj_rows:
-                        _sb_delete("mp_adjudicaciones", "licitacion_id", codigo)
-                        _sb_upsert("mp_adjudicaciones", "licitacion_id,item_no,proveedor_rut", adj_rows)
+                    # Solo se toca si hay algo con que reemplazar: si el detalle
+                    # vino sin items (respuesta parcial de la API), el delete
+                    # incondicional borraba filas buenas y no las reponia.
+                    # _reemplazar_hijos escribe primero y borra el sobrante despues.
+                    _reemplazar_hijos(codigo, item_rows, adj_rows)
                     total += 1
                 except Exception as e:
                     log.warning("Error lic %s: %s", codigo, repr(e))
@@ -355,6 +373,9 @@ def main():
     backfill_compra_agil()
     backfill_oc()
     log.info("=== backfill_noche completado ===")
+
+    # Rojo si se perdió alguna escritura hacia Supabase.
+    sb.exit_si_hubo_fallos()
 
 if __name__ == "__main__":
     main()

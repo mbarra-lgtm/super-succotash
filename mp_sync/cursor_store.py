@@ -46,35 +46,55 @@ def _file_save(key, value):
     except Exception as e:
         log.warning("cursor file save %s: %s", key, e)
 
+class CursorError(RuntimeError):
+    """No se pudo leer o guardar el cursor en Supabase."""
+
+
+def _usar_archivo() -> bool:
+    return BACKEND == "file" or not SUPABASE_URL or not SB_KEY
+
+
 def load_cursor(key: str, default=None):
+    """Lee el cursor. Levanta si Supabase responde mal.
+
+    Antes, un error HTTP devolvía `default` en silencio: para sync_activas eso
+    significa arrancar el round-robin desde la posición 0, y el barrido nunca
+    llega a la cola de la lista. Un cursor que se pierde sin ruido es peor que
+    una corrida que falla, porque el daño no se ve.
+    """
     if default is None:
         default = {}
-    if BACKEND == "file" or not SUPABASE_URL or not SB_KEY:
-        return _file_load(key, default)
-    try:
-        r = requests.get(f"{SB_REST}/{T_CURSOR}", headers=_headers(),
-                         params={"select": "value", "key": f"eq.{key}", "limit": "1"},
-                         timeout=20)
-        if r.ok and r.json():
-            return r.json()[0]["value"]
-        return default
-    except Exception as e:
-        log.warning("cursor supabase load %s: %s — fallback archivo", key, e)
+    if _usar_archivo():
         return _file_load(key, default)
 
+    r = requests.get(f"{SB_REST}/{T_CURSOR}", headers=_headers(),
+                     params={"select": "value", "key": f"eq.{key}", "limit": "1"},
+                     timeout=20)
+    if not r.ok:
+        raise CursorError(f"load {key}: HTTP {r.status_code} — {r.text[:150]}")
+    filas = r.json()
+    # Sin fila es legítimo: es la primera corrida de esa clave.
+    return filas[0]["value"] if filas else default
+
+
 def save_cursor(key: str, value):
-    if BACKEND == "file" or not SUPABASE_URL or not SB_KEY:
+    """Guarda el cursor. Levanta si no se pudo — NO cae a un archivo local.
+
+    El fallback a `.cursor_<key>.json` era una trampa en GitHub Actions: el
+    runner se destruye al terminar el job y el archivo se va con él, así que el
+    cursor quedaba clavado en su último valor bueno mientras el log decía
+    "fallback archivo" en un WARNING que nadie mira. El cursor de compra ágil
+    estuvo así 9 días. El archivo sigue disponible con CURSOR_BACKEND=file, que
+    es cuando de verdad tiene sentido (correr a mano, sin red).
+    """
+    if _usar_archivo():
         return _file_save(key, value)
-    try:
-        from datetime import datetime, timezone
-        r = requests.post(f"{SB_REST}/{T_CURSOR}", headers=_headers(),
-                          params={"on_conflict": "key"},
-                          json=[{"key": key, "value": value,
-                                 "updated_at": datetime.now(timezone.utc).isoformat()}],
-                          timeout=20)
-        if not r.ok:
-            log.warning("cursor supabase save %s: %s — fallback archivo", key, r.text[:150])
-            _file_save(key, value)
-    except Exception as e:
-        log.warning("cursor supabase save %s: %s — fallback archivo", key, e)
-        _file_save(key, value)
+
+    from datetime import datetime, timezone
+    r = requests.post(f"{SB_REST}/{T_CURSOR}", headers=_headers(),
+                      params={"on_conflict": "key"},
+                      json=[{"key": key, "value": value,
+                             "updated_at": datetime.now(timezone.utc).isoformat()}],
+                      timeout=20)
+    if not r.ok:
+        raise CursorError(f"save {key}: HTTP {r.status_code} — {r.text[:150]}")

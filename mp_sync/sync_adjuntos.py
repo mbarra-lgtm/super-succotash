@@ -36,6 +36,8 @@ Env:
 import os, re, time, html, logging
 import requests
 
+import sb_client as sb
+
 logging.basicConfig(level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
 log = logging.getLogger("sync_adjuntos")
@@ -59,16 +61,13 @@ _mp = requests.Session()
 _mp.headers.update({"User-Agent": UA})
 
 
-def sb_select(table, params):
-    r = _sb.get(f"{SB_REST}/{table}", params=params, timeout=60)
-    r.raise_for_status(); return r.json()
+# Este script ya levantaba con raise_for_status(), así que estaba sano: lo que
+# gana al pasar por sb_client son los reintentos ante 429/5xx/522, el
+# cortacircuitos y el contador de fallos.
+sb_select = sb.select
 
 def sb_upsert(table, rows, on_conflict):
-    if not rows: return
-    r = _sb.post(f"{SB_REST}/{table}", params={"on_conflict": on_conflict},
-        headers={"Prefer": "resolution=merge-duplicates,return=minimal"},
-        json=rows, timeout=60)
-    r.raise_for_status()
+    sb.upsert(table, on_conflict, rows)
 
 
 def codigos_pendientes(limite):
@@ -145,14 +144,13 @@ def main():
             log.error("[%d/%d] %s FALLÓ: %r", i, len(codigos), c, e)
             sb_upsert(T_COLA, [{"codigo": c, "estado": "error"}], "codigo")
         time.sleep(SLEEP)
-    try:
-        sb_upsert("data_freshness", [{
-            "dataset": "mp_adjuntos",
-            "refreshed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "rows_changed": total, "source": "sync_adjuntos.py (listado)"}], "dataset")
-    except Exception as e:
-        log.warning("No pude estampar data_freshness: %r", e)
+    # No estampa si la corrida tuvo fallos: el panel usa data_freshness para
+    # decidir si el dato está fresco, y un latido sobre una corrida rota es cómo
+    # un pipeline caído se ve verde durante días.
+    sb.stamp_freshness("mp_adjuntos", total, "sync_adjuntos.py (listado)")
     log.info("Listo: %d anexos listados.", total)
+
+    sb.exit_si_hubo_fallos()
 
 
 if __name__ == "__main__":
