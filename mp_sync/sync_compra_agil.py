@@ -2,12 +2,16 @@
 sync_compra_agil.py
 ===================
 Busca Compras Ágiles nuevas o modificadas.
-Programar: cada 30 minutos.
+Programar: cada 2 h (workflow mp-compra-agil.yml, timeout 30 min).
 
 Lógica:
   - Trae solo cambios desde la última ejecución (incremental)
-  - Guarda timestamp en .cursor_ca.json
+  - La ventana [cursor → ahora] se recorre en TROZOS de CA_CHUNK_HORAS y el
+    cursor se guarda al cerrar cada trozo, no al final: un fallo cuesta el trozo
+    en curso y no la corrida entera, así el atraso siempre drena
+  - Cursor en Supabase (mp_sync_cursor, key="compra_agil")
   - Para estados con detalle (cerrada+), trae proveedores/productos
+  - Sale con código 1 si no cerró ni un trozo: un cursor clavado tiene que verse
 """
 
 import os, sys, time, json, logging, requests, random
@@ -42,6 +46,25 @@ CURSOR_FILE  = os.getenv("CA_CURSOR_FILE",
                os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cursor_ca.json"))
 VENTANA_HORAS = int(os.getenv("CA_VENTANA_HORAS", "1"))  # horas atrás si no hay cursor
 
+# ── Ventanas troceadas ───────────────────────
+# El cursor solo avanzaba si la ventana COMPLETA [cursor → ahora] se leía sin un
+# solo error. Con el cursor atrasado esa ventana crece sin techo, y a mas paginas
+# mas probable es que una falle: entonces no se avanza, la ventana crece otro
+# tanto, y el atraso no se recupera nunca. (Paso: el cursor quedo clavado 9 dias
+# y cada corrida repetia 236 paginas para terminar sin avanzar.)
+#
+# Ahora la ventana se trocea y el cursor se guarda al cerrar CADA trozo: un fallo
+# cuesta el trozo en curso, no la corrida entera, y el atraso drena solo.
+CHUNK_HORAS   = float(os.getenv("CA_CHUNK_HORAS", "6"))
+# Presupuesto de pared para la fase de listado. El job tiene timeout de 30 min;
+# se deja margen para la fase de detalles y para el arranque del runner.
+PRESUP_LISTADO_S = float(os.getenv("CA_PRESUP_LISTADO_S", "1200"))   # 20 min
+PRESUP_DETALLE_S = float(os.getenv("CA_PRESUP_DETALLE_S", "420"))    # 7 min
+MAX_DETALLE      = int(os.getenv("CA_MAX_DETALLE", "300"))
+# Reintentos hacia MP y hacia Supabase
+MP_INTENTOS  = int(os.getenv("CA_MP_INTENTOS", "5"))
+SB_INTENTOS  = int(os.getenv("CA_SB_INTENTOS", "4"))
+
 ESTADOS_DETALLE = {"cerrada", "desierta", "cancelada", "proveedor_seleccionado"}
 
 T_MAIN  = "mp_compra_agil"
@@ -54,54 +77,130 @@ T_PCOT  = "mp_ca_productos_cotizados"
 _session = requests.Session()
 _session.headers.update({"Accept": "application/json"})
 
+class MPTransitorio(Exception):
+    """429 o 5xx persistente de Mercado Público tras agotar los reintentos."""
+
+
 def _mp_get(path: str, params: dict) -> dict:
-    r = _session.get(f"{MP_BASE}{path}",
-                     headers={"ticket": MP_TICKET}, params=params, timeout=45)
-    if r.status_code == 429:
-        log.warning("429 — esperando 60s...")
-        time.sleep(60)
-        r = _session.get(f"{MP_BASE}{path}",
-                         headers={"ticket": MP_TICKET}, params=params, timeout=45)
-    r.raise_for_status()
-    data = r.json()
-    if data.get("success") != "OK":
-        raise RuntimeError(f"API error: {data.get('errors')}")
-    return data["payload"]
+    """GET a MP con backoff exponencial ante 429 y 5xx.
+
+    Antes habia un solo reintento a los 60 s: en una ventana de cientos de
+    paginas basta un 429 seguido de otro para tumbar la corrida completa, que es
+    justo lo que impedia avanzar el cursor.
+    """
+    ultimo = None
+    for intento in range(MP_INTENTOS):
+        try:
+            r = _session.get(f"{MP_BASE}{path}",
+                             headers={"ticket": MP_TICKET}, params=params, timeout=45)
+        except requests.RequestException as e:
+            ultimo = e
+        else:
+            if r.status_code == 429 or r.status_code >= 500:
+                ultimo = f"HTTP {r.status_code}"
+            else:
+                r.raise_for_status()
+                data = r.json()
+                if data.get("success") != "OK":
+                    # Error de negocio: reintentar no ayuda.
+                    raise RuntimeError(f"API error: {data.get('errors')}")
+                return data["payload"]
+
+        if intento < MP_INTENTOS - 1:
+            espera = min(120.0, (2 ** intento) * 15) + random.uniform(0, 5)
+            log.warning("MP %s (%s) — reintento %d/%d en %.0fs",
+                        path, ultimo, intento + 1, MP_INTENTOS - 1, espera)
+            time.sleep(espera)
+
+    raise MPTransitorio(f"{path}: {ultimo} tras {MP_INTENTOS} intentos")
 
 def _sb_headers():
     return {"apikey": SB_KEY, "Authorization": f"Bearer {SB_KEY}",
             "Content-Type": "application/json",
             "Prefer": "resolution=merge-duplicates,return=minimal"}
 
+def _sb_request(metodo, table, **kw):
+    """Llamada a Supabase con reintentos ante 429/5xx; levanta si no se logra.
+
+    Una escritura que solo se loguea deja al cursor avanzar sobre datos que nunca
+    entraron: la ventana no se vuelve a consultar y el hueco es permanente.
+    """
+    ultimo = None
+    for intento in range(SB_INTENTOS):
+        try:
+            r = requests.request(metodo, f"{SB_REST}/{table}",
+                                 headers=_sb_headers(), timeout=60, **kw)
+        except requests.RequestException as e:
+            ultimo = repr(e)
+        else:
+            if r.ok:
+                return r
+            ultimo = f"{r.status_code}: {r.text[:200]}"
+            if 400 <= r.status_code < 500 and r.status_code != 429:
+                # Payload o esquema mal: reintentar no cambia nada.
+                raise RuntimeError(f"SB {metodo} {table} — {ultimo}")
+
+        if intento < SB_INTENTOS - 1:
+            espera = min(60.0, (2 ** intento) * 5) + random.uniform(0, 3)
+            log.warning("SB %s %s (%s) — reintento %d/%d en %.0fs",
+                        metodo, table, ultimo, intento + 1, SB_INTENTOS - 1, espera)
+            time.sleep(espera)
+
+    raise RuntimeError(f"SB {metodo} {table} falló tras {SB_INTENTOS} intentos — {ultimo}")
+
 def _sb_upsert(table, on_conflict, rows):
     if not rows: return
-    r = requests.post(f"{SB_REST}/{table}", headers=_sb_headers(),
-                      params={"on_conflict": on_conflict} if on_conflict else {},
-                      json=rows, timeout=60)
-    if not r.ok: log.error("SB %s: %s", table, r.text[:200])
+    _sb_request("POST", table,
+                params={"on_conflict": on_conflict} if on_conflict else {},
+                json=rows)
 
 def _sb_delete(table, id_mp):
-    requests.delete(f"{SB_REST}/{table}", headers=_sb_headers(),
-                    params={"id_mp": f"eq.{id_mp}"}, timeout=30)
+    _sb_request("DELETE", table, params={"id_mp": f"eq.{id_mp}"})
 
 def _sb_select(table, id_mp):
-    r = requests.get(f"{SB_REST}/{table}", headers=_sb_headers(),
-                     params={"select": "*", "id_mp": f"eq.{id_mp}"}, timeout=30)
-    return r.json() if r.ok else []
+    return _sb_request("GET", table,
+                       params={"select": "*", "id_mp": f"eq.{id_mp}"}).json()
+
+def _sb_con_detalle(ids: list) -> set:
+    """IDs que ya tienen detalle sincronizado, en bloque.
+
+    Reemplaza un SELECT por item: con un atraso de miles de compras ágiles, esa
+    consulta uno-a-uno era la mitad del costo de la fase de detalles.
+    """
+    if not ids: return set()
+    out = set()
+    for i in range(0, len(ids), 100):
+        lote = ids[i:i + 100]
+        filas = _sb_request("GET", T_MAIN, params={
+            "select": "id_mp",
+            "id_mp": f"in.({','.join(lote)})",
+            "detail_synced_at": "not.is.null",
+            "id_orden_compra": "not.is.null",
+            "limit": str(len(lote) + 1),
+        }).json()
+        out.update(f["id_mp"] for f in filas)
+    return out
 
 # ── Cursor (persistido en Supabase: mp_sync_cursor, key="compra_agil") ──
-def _load_cursor() -> str:
+def _fmt(dt: datetime) -> str:
+    """Formato que espera la API de compra ágil: hora Chile, sin zona."""
+    return dt.astimezone(TZ_CL).strftime("%Y-%m-%dT%H:%M:%S")
+
+def _load_cursor() -> datetime:
+    """Momento desde el cual hay que leer, como datetime con zona Chile."""
     try:
         data = load_cursor("compra_agil", {})
-        if data.get("ultimo_cambio"):
-            return data["ultimo_cambio"]
-    except: pass
-    # Sin cursor: última ventana en hora Chile
-    desde = datetime.now(TZ_CL) - timedelta(hours=VENTANA_HORAS)
-    return desde.strftime("%Y-%m-%dT%H:%M:%S")
+        crudo = (data or {}).get("ultimo_cambio")
+        if crudo:
+            dt = datetime.fromisoformat(crudo.replace("Z", "+00:00"))
+            # Los cursores viejos se guardaron sin zona, en hora Chile.
+            return dt.astimezone(TZ_CL) if dt.tzinfo else dt.replace(tzinfo=TZ_CL)
+    except Exception as e:
+        log.warning("Cursor ilegible (%r) — se usa la ventana por defecto", e)
+    return datetime.now(TZ_CL) - timedelta(hours=VENTANA_HORAS)
 
-def _save_cursor(ts: str):
-    save_cursor("compra_agil", {"ultimo_cambio": ts})
+def _save_cursor(dt: datetime):
+    save_cursor("compra_agil", {"ultimo_cambio": _fmt(dt)})
 
 # ── Parsers ──────────────────────────────────
 def _date(v): return v[:10] if v else None
@@ -190,81 +289,112 @@ def _sync_detalle(id_mp: str):
         _sb_upsert(T_PROVS, "id_mp,id_cotizacion", pv_rows)
 
 # ── Main ─────────────────────────────────────
-def main():
-    ahora    = datetime.now(timezone.utc)
-    ahora_cl = ahora.astimezone(TZ_CL)
-    desde    = _load_cursor()
+def _procesar_ventana(desde: datetime, hasta: datetime) -> tuple:
+    """Lee y escribe un trozo completo de ventana. Levanta si no lo logra entero.
 
-    # La API de compra ágil trabaja en hora Chile — convertir si viene en UTC
-    if desde.endswith("Z"):
-        try:
-            dt_desde = datetime.fromisoformat(desde.replace("Z", "+00:00"))
-            desde = dt_desde.astimezone(TZ_CL).strftime("%Y-%m-%dT%H:%M:%S")
-        except: pass
-
-    log.info("=== sync_compra_agil === desde: %s (hora Chile)", desde)
-
+    Devuelve (filas_escritas, ids_con_detalle_pendiente). El trozo es la unidad
+    atómica de progreso: solo si vuelve sin excepción el cursor puede avanzar.
+    """
     params = {
-        "cambio_desde":  desde,
-        "cambio_hasta":  ahora_cl.strftime("%Y-%m-%dT%H:%M:%S"),
+        "cambio_desde":  _fmt(desde),
+        "cambio_hasta":  _fmt(hasta),
         "ordenar_por":   "FechaUltimaModificacion",
         "tamano_pagina": PAGE_SIZE,
         "numero_pagina": 1,
     }
 
-    total = 0
-    pendientes_detalle = []
-    pagina = 1
-    listado_completo = True
-
+    filas, pendientes, pagina, total_paginas = 0, [], 1, "?"
     while True:
         params["numero_pagina"] = pagina
-        try:
-            payload = _mp_get("/v2/compra-agil", params)
-            time.sleep(SLEEP)
-        except Exception as e:
-            log.error("Error listado página %d: %s", pagina, repr(e))
-            listado_completo = False
-            break
+        payload = _mp_get("/v2/compra-agil", params)
+        time.sleep(SLEEP)
 
         pag   = payload["paginacion"]
         items = payload["items"]
+        total_paginas = pag["total_paginas"]
         if not items: break
 
-        rows = [_parse_main(i) for i in items]
-        _sb_upsert(T_MAIN, "id_mp", rows)
-        total += len(rows)
+        _sb_upsert(T_MAIN, "id_mp", [_parse_main(i) for i in items])
+        filas += len(items)
+        pendientes += [i["codigo"] for i in items
+                       if (i.get("estado") or {}).get("codigo") in ESTADOS_DETALLE]
 
-        for item in items:
-            if (item.get("estado") or {}).get("codigo") in ESTADOS_DETALLE:
-                pendientes_detalle.append(item["codigo"])
-
-        log.info("Página %d/%d → %d filas", pagina, pag["total_paginas"], len(rows))
-        if pagina >= pag["total_paginas"]: break
+        if pagina >= total_paginas: break
         pagina += 1
 
-    log.info("Listado: %d filas. Detalles pendientes: %d", total, len(pendientes_detalle))
+    log.info("  %s → %s: %d filas en %s pág.",
+             _fmt(desde)[5:16], _fmt(hasta)[5:16], filas, total_paginas)
+    return filas, pendientes
 
-    # Guardar el cursor APENAS termina el listado. La fase de detalles es
-    # enriquecimiento (idempotente) y no debe bloquear el avance del cursor:
-    # si falla o es lenta, no queremos reprocesar todo el listado en la próxima
-    # corrida (eso causaba runs gigantes de miles de filas).
-    # ...pero si el LISTADO quedo incompleto no se avanza: esa ventana no vuelve a
-    # consultarse nunca y las compras agiles de las paginas no leidas se perdian.
-    if listado_completo:
-        _save_cursor(ahora_cl.strftime("%Y-%m-%dT%H:%M:%S"))
-        log.info("Cursor guardado: %s (hora Chile)", ahora_cl.strftime("%Y-%m-%dT%H:%M:%S"))
-    else:
-        log.error("Listado incompleto: NO se avanza el cursor; la ventana se reintenta.")
 
-    for id_mp in pendientes_detalle:
+def main():
+    t0       = time.monotonic()
+    ahora_cl = datetime.now(TZ_CL)
+    desde    = _load_cursor()
+    atraso_h = (ahora_cl - desde).total_seconds() / 3600
+
+    log.info("=== sync_compra_agil === desde %s (atraso %.1f h, trozos de %.0f h)",
+             _fmt(desde), atraso_h, CHUNK_HORAS)
+    if atraso_h > 24:
+        log.warning("Atraso de %.1f días: la corrida drena lo que alcance y "
+                    "el resto queda para la siguiente.", atraso_h / 24)
+
+    total, pendientes, trozos = 0, [], 0
+    corte = None
+
+    while desde < ahora_cl:
+        if time.monotonic() - t0 > PRESUP_LISTADO_S:
+            corte = "presupuesto de tiempo"
+            break
+
+        hasta = min(desde + timedelta(hours=CHUNK_HORAS), ahora_cl)
         try:
-            rows = _sb_select(T_MAIN, id_mp)
-            if rows and rows[0].get("detail_synced_at") and rows[0].get("id_orden_compra"):
-                continue
-            _sync_detalle(id_mp)
+            filas, pend = _procesar_ventana(desde, hasta)
         except Exception as e:
-            log.warning("Error detalle %s: %s", id_mp, repr(e))
+            # El trozo en curso se pierde; los ya cerrados quedan guardados.
+            corte = repr(e)
+            log.error("Trozo %s → %s falló: %s", _fmt(desde), _fmt(hasta), repr(e))
+            break
+
+        # Solo aquí, con el trozo íntegramente leído Y escrito, avanza el cursor.
+        _save_cursor(hasta)
+        desde   = hasta
+        total  += filas
+        trozos += 1
+        pendientes += pend
+
+    log.info("Listado: %d trozos cerrados, %d filas. Cursor en %s (atraso %.1f h)",
+             trozos, total, _fmt(desde), (ahora_cl - desde).total_seconds() / 3600)
+    if corte:
+        log.error("Listado incompleto (%s) — se retoma desde el cursor en la próxima corrida.", corte)
+
+    # ── Detalles: enriquecimiento idempotente, no bloquea el cursor ──
+    pendientes = list(dict.fromkeys(pendientes))          # únicos, orden estable
+    errores_detalle = 0
+    if pendientes:
+        ya = _sb_con_detalle(pendientes)
+        faltan = [i for i in pendientes if i not in ya][:MAX_DETALLE]
+        log.info("Detalles: %d candidatos, %d ya tenían, %d en esta corrida",
+                 len(pendientes), len(ya), len(faltan))
+        for id_mp in faltan:
+            if time.monotonic() - t0 > PRESUP_LISTADO_S + PRESUP_DETALLE_S:
+                log.warning("Presupuesto de detalles agotado — quedan %d para la próxima",
+                            len(faltan) - faltan.index(id_mp))
+                break
+            try:
+                _sync_detalle(id_mp)
+            except Exception as e:
+                errores_detalle += 1
+                log.warning("Error detalle %s: %s", id_mp, repr(e))
+
+    # El job tiene que ponerse rojo si el listado no avanzó: un cursor clavado es
+    # exactamente el modo de falla que dejó 9 días sin sincronizar en silencio.
+    if trozos == 0 and corte:
+        log.error("Ningún trozo cerrado en esta corrida.")
+        sys.exit(1)
+    if errores_detalle:
+        log.warning("%d detalles con error (se reintentan solos la próxima corrida)",
+                    errores_detalle)
 
 if __name__ == "__main__":
     main()
