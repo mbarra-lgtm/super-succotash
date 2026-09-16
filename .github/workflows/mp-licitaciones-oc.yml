@@ -1,9 +1,21 @@
-name: MP · Licitaciones (cada 1h)
+name: MP · Licitaciones nuevas (cada 1h)
+
+# PASE LIVIANO DIURNO. Solo detecta licitaciones que aún no están en BD; no hace
+# el refresco round-robin de las ~4.500 activas (eso lo hace mp-licitaciones-barrido
+# de madrugada).
+#
+# Por qué se partió en dos: las dos mitades del script tienen costos muy
+# distintos. Las altas son pocas llamadas (suele haber 0-2 pendientes por hora) y
+# son las que tienen valor comercial — una licitación publicada hay que verla el
+# mismo día. El refresco son cientos de escrituras por corrida y solo actualiza
+# datos que ya tenemos, así que puede esperar a la noche.
+#
+# El 16-09-2026, al arreglar los fallos silenciosos, este job pasó de escribir
+# ~400 filas/día a ~400/hora y se volvió el 62% de la carga de la base, que corre
+# en una instancia de 1 GB con 10 GB de datos.
 
 on:
   schedule:
-    # Cada hora, minuto 15 (UTC). A 2 h el barrido no alcanzaba a dar una vuelta
-    # completa a las ~4.000 activas y la cola de la lista quedaba sin visitar.
     - cron: "15 * * * *"
   workflow_dispatch:
 
@@ -14,7 +26,7 @@ concurrency:
 jobs:
   sync:
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 15
     defaults:
       run:
         working-directory: mp_sync
@@ -24,12 +36,13 @@ jobs:
       TICKET_ACTIVAS:       ${{ secrets.TICKET_ACTIVAS }}
       CURSOR_BACKEND:       supabase
       SLEEP_BETWEEN:        "2.0"
-      # 400 × ~2,5 s ≈ 17 min, holgado contra el timeout de 40.
-      # 24 corridas × 400 = 9.600 posiciones/día ≈ 2 vueltas completas.
-      LIC_MAX_POR_RUN:      "400"
-      # Cupo de la ventana reservado a licitaciones que aún no están en BD.
-      # Vacío = toda la ventana si hace falta (útil para drenar el atraso).
-      LIC_MAX_NUEVAS:       "400"
+      # Solo altas: el cupo de refresco queda en 0 y el cursor del barrido NO se
+      # mueve, así la corrida nocturna lo retoma donde lo dejó.
+      LIC_SOLO_NUEVAS:      "1"
+      # Techo por si un día aparece un atraso grande de altas. En régimen normal
+      # se usan 1 o 2 de estos 120.
+      LIC_MAX_POR_RUN:      "120"
+      LIC_MAX_NUEVAS:       "120"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -37,5 +50,5 @@ jobs:
           python-version: "3.13"
           cache: pip
       - run: pip install -r requirements.txt
-      - name: Licitaciones activas
+      - name: Licitaciones nuevas
         run: python sync_activas.py

@@ -25,13 +25,16 @@ on:
         default: "400"
 
 concurrency:
-  group: mp-refetch-adj
+  # Compartido con el barrido de activas: la instancia de Supabase es de 1 GB
+  # y no tolera dos trabajos pesados simultáneos. Estos jobs son resumibles,
+  # así que esperar (o saltarse una corrida) no pierde datos.
+  group: mp-pesado
   cancel-in-progress: false
 
 jobs:
   refetch:
     runs-on: ubuntu-latest
-    timeout-minutes: 300
+    timeout-minutes: 90
     defaults:
       run:
         working-directory: mp_sync

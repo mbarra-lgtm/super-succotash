@@ -1,0 +1,56 @@
+name: MP · Barrido de activas (madrugada)
+
+# REFRESCO PESADO, FUERA DE LA JORNADA. Recorre en round-robin las ~4.500
+# licitaciones activas para detectar cambios de estado, fechas y adjudicaciones.
+#
+# 8 corridas × 600 = 4.800 posiciones por noche ≈ una vuelta completa diaria,
+# que es la misma cobertura que tenía el barrido horario cuando funcionaba.
+#
+# Horario: 20:40 a 03:40 hora Chile. Minuto :40 para no chocar con los otros
+# jobs, que arrancan en :00, :05, :15 y :35.
+#
+# Comparte grupo de concurrencia con los backfills (mp-pesado): la instancia de
+# Supabase es de 1 GB y no tolera dos trabajos pesados a la vez. Si uno está
+# corriendo, el siguiente espera; si se cancela por eso, no se pierde nada —
+# estos jobs son resumibles por diseño y retoman desde su cursor.
+
+on:
+  schedule:
+    - cron: "40 23,0,1,2,3,4,5,6 * * *"
+  workflow_dispatch:
+    inputs:
+      por_run:
+        description: "Licitaciones por corrida"
+        default: "600"
+
+concurrency:
+  group: mp-pesado
+  cancel-in-progress: false
+
+jobs:
+  barrido:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    defaults:
+      run:
+        working-directory: mp_sync
+    env:
+      SUPABASE_URL:         ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+      TICKET_ACTIVAS:       ${{ secrets.TICKET_BARRIDO || secrets.TICKET_ACTIVAS }}
+      CURSOR_BACKEND:       supabase
+      SLEEP_BETWEEN:        "2.0"
+      # 600 × ~2,5 s ≈ 25 min, holgado contra el timeout de 40.
+      LIC_MAX_POR_RUN:      ${{ github.event.inputs.por_run || '600' }}
+      # Las altas ya las tomó el pase horario; acá el grueso es refresco. Se deja
+      # un cupo chico por si alguna se publicó entre medio.
+      LIC_MAX_NUEVAS:       "50"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Barrido de activas
+        run: python sync_activas.py

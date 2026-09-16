@@ -8,11 +8,16 @@ name: MP · OC del grupo por proveedor (cada 6h)
 
 on:
   schedule:
-    - cron: "20 */6 * * *"
+    # Antes "20 */6": dos de las cuatro corridas caían en plena jornada
+    # (05:20 y 11:20 Chile). Mismas 4 corridas, todas de noche.
+    - cron: "20 0,2,4,6 * * *"   # 21:20, 23:20, 01:20 y 03:20 Chile
   workflow_dispatch:
 
 concurrency:
-  group: mp-oc-grupo
+  # Compartido con el barrido de activas: la instancia de Supabase es de 1 GB
+  # y no tolera dos trabajos pesados simultáneos. Estos jobs son resumibles,
+  # así que esperar (o saltarse una corrida) no pierde datos.
+  group: mp-pesado
   cancel-in-progress: false
 
 jobs:
