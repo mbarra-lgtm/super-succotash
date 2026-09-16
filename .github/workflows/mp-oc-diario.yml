@@ -3,9 +3,13 @@ name: MP · OC del día (API, 1x/día)
 # Frescura del mes en curso: trae las OCs de hoy/ayer vía API.
 # El grueso histórico lo consolida "MP · OC Datos Abiertos" (día 22, mes vencido).
 
+# Los crones son UTC. Chile alterna UTC-3 (sept-abril) y UTC-4 (abril-sept),
+# asi que la hora local se corre una hora dos veces al año. Las horas de los
+# comentarios son en UTC-3; en invierno resta una hora.
+
 on:
   schedule:
-    - cron: "45 9 * * *"       # 09:45 UTC ≈ 05:45-06:45 CL, antes de la jornada
+    - cron: "5 9 * * *"        # 06:05 Chile (UTC-3)
   workflow_dispatch:
 
 concurrency:

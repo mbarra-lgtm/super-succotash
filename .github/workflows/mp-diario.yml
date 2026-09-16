@@ -1,8 +1,14 @@
 name: MP · Estados + CRM (diario)
 
+# Los crones son UTC. Chile alterna UTC-3 (sept-abril) y UTC-4 (abril-sept),
+# asi que la hora local se corre una hora dos veces al año. Las horas de los
+# comentarios son en UTC-3; en invierno resta una hora.
+
 on:
   schedule:
-    - cron: "0 10 * * *"       # 10:00 UTC ≈ 06:00 Chile
+    - cron: "30 9 * * *"         # 06:30 Chile (UTC-3). Con el techo de 90 min
+                             # termina 08:00 a más tardar: es el último job
+                             # antes de la jornada y no puede pisarla.
   workflow_dispatch:
 
 concurrency:
@@ -12,7 +18,7 @@ concurrency:
 jobs:
   sync:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 90
     defaults:
       run:
         working-directory: mp_sync

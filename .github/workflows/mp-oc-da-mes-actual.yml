@@ -6,9 +6,13 @@ name: MP · OC Datos Abiertos (mes en curso, diario)
 # y cualquier informe emitido antes del dia 22 subestima el volumen.
 # La carga del mes vencido sigue en mp-oc-datos-abiertos.yml (dia 22).
 
+# Los crones son UTC. Chile alterna UTC-3 (sept-abril) y UTC-4 (abril-sept),
+# asi que la hora local se corre una hora dos veces al año. Las horas de los
+# comentarios son en UTC-3; en invierno resta una hora.
+
 on:
   schedule:
-    - cron: "0 8 * * *"        # 08:00 UTC ≈ 04:00-05:00 CL, despues de la ingesta por API
+    - cron: "45 7 * * *"        # 04:45 Chile (UTC-3)
   workflow_dispatch:
     inputs:
       meses:
@@ -22,7 +26,7 @@ concurrency:
 jobs:
   cargar:
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    timeout-minutes: 75
     defaults:
       run:
         working-directory: mp_sync

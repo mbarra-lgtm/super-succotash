@@ -6,18 +6,24 @@ name: MP · OC del grupo por proveedor (cada 6h)
 # competitiva. Nuestras propias OC son dato operativo, no analitica: van aparte,
 # mas seguido y con presupuesto propio.
 
+# Los crones son UTC. Chile alterna UTC-3 (sept-abril) y UTC-4 (abril-sept),
+# asi que la hora local se corre una hora dos veces al año. Las horas de los
+# comentarios son en UTC-3; en invierno resta una hora.
+
 on:
   schedule:
-    # Antes "20 */6": dos de las cuatro corridas caían en plena jornada
-    # (05:20 y 11:20 Chile). Mismas 4 corridas, todas de noche.
-    - cron: "20 0,2,4,6 * * *"   # 21:20, 23:20, 01:20 y 03:20 Chile
+    # Antes "20 */6": dos de las cuatro corridas caían en plena jornada.
+    # Mismas 4 corridas, todas de noche, en los huecos que deja el barrido
+    # (que ocupa de :40 a :05 de cada hora).
+    - cron: "10 23,1,3,5 * * *"   # 20:10, 22:10, 00:10 y 02:10 Chile
   workflow_dispatch:
 
 concurrency:
-  # Compartido con el barrido de activas: la instancia de Supabase es de 1 GB
-  # y no tolera dos trabajos pesados simultáneos. Estos jobs son resumibles,
-  # así que esperar (o saltarse una corrida) no pierde datos.
-  group: mp-pesado
+  # Carril propio A PROPOSITO, no mp-pesado. Este job existe justamente para que
+  # las OC del grupo no queden detras de la inteligencia competitiva; meterlo en
+  # la cola compartida con el backfill de 59 RUTs lo dejaria cancelandose contra
+  # el, que es el problema que vino a resolver. Son 3 RUTs: no pesa.
+  group: mp-oc-grupo
   cancel-in-progress: false
 
 jobs:
