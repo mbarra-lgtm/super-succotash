@@ -20,6 +20,10 @@ try:
 except ImportError:
     pass
 
+# Después de load_dotenv: sb_client lee SUPABASE_URL / SUPABASE_SERVICE_KEY al
+# importarse, así que necesita el .env ya cargado para correr a mano.
+import sb_client as sb
+
 logging.basicConfig(level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S")
@@ -60,31 +64,39 @@ def _sb_headers():
             "Content-Type": "application/json",
             "Prefer": "resolution=merge-duplicates,return=minimal"}
 
-def _sb_upsert(table, on_conflict, rows):
-    if not rows: return 0
-    r = requests.post(f"{SB_REST}/{table}", headers=_sb_headers(),
-                      params={"on_conflict": on_conflict} if on_conflict else {},
-                      json=rows, timeout=60)
-    if not r.ok: log.error("SB %s: %s", table, r.text[:300])
-    return len(rows)
+# Las escrituras y lecturas van por sb_client: reintenta 429/5xx/522, levanta si
+# no lo logra y contabiliza el fallo. Se mantienen los nombres _sb_* para no
+# tocar a backfill_oc_por_proveedor.py, que los importa desde aquí.
+_sb_upsert = sb.upsert
 
 def _sb_delete(table, col, val):
-    requests.delete(f"{SB_REST}/{table}", headers=_sb_headers(),
-                    params={col: f"eq.{val}"}, timeout=30)
+    sb.delete(table, {col: f"eq.{val}"})
 
 def _sb_estados_bulk(codigos):
-    """Retorna dict codigo_oc -> (estado_codigo, tiene_raw) de las ya en BD."""
-    out = {}
-    for i in range(0, len(codigos), 100):
-        chunk = codigos[i:i+100]
-        r = requests.get(f"{SB_REST}/{T_HDR}", headers=_sb_headers(),
-                         params={"select": "codigo_oc,estado_codigo,raw_hash",
-                                 "codigo_oc": f"in.({','.join(chunk)})",
-                                 "limit": str(len(chunk)+1)}, timeout=30)
-        if r.ok:
-            for row in r.json():
-                out[row["codigo_oc"]] = (row.get("estado_codigo"), bool(row.get("raw_hash")))
-    return out
+    """Retorna dict codigo_oc -> (estado_codigo, tiene_raw) de las ya en BD.
+
+    Antes, un chunk que fallaba se saltaba con `if r.ok:` y el dict volvía
+    incompleto: las OC de ese chunk se trataban como nuevas y se volvían a pedir
+    a MP enteras. Ahora un fallo aborta la corrida en vez de mentir.
+    """
+    filas = sb.select_in(T_HDR, "codigo_oc,estado_codigo,raw_hash",
+                         "codigo_oc", codigos, chunk=100)
+    return {f["codigo_oc"]: (f.get("estado_codigo"), bool(f.get("raw_hash")))
+            for f in filas}
+
+def _reemplazar_items(cod, items):
+    """Deja en BD exactamente los items del detalle recién leído.
+
+    El orden importa. Antes se borraba y después se insertaba: si el INSERT
+    fallaba quedaban líneas borradas y sin reponer — pérdida real, no un hueco,
+    y encima la cabecera ya tenía raw_hash, así que esa OC no se volvía a mirar.
+    Ahora se escribe primero y se borra sólo lo que sobró, de modo que en ningún
+    instante la OC queda sin líneas.
+    """
+    sb.upsert(T_ITEMS, "codigo_oc,line_no", items)
+    vivos = [str(i["line_no"]) for i in items]
+    sb.delete(T_ITEMS, {"codigo_oc": f"eq.{cod}",
+                        "line_no": f"not.in.({','.join(vivos)})"})
 
 def _hash(obj):
     return hashlib.md5(json.dumps(obj, sort_keys=True, default=str).encode()).hexdigest()
@@ -262,10 +274,20 @@ def main():
                 sin_det += 1
                 continue
             hdr, items = parse_oc_detalle(oc)
+
+            # El raw_hash es el testigo de "cabecera + items escritos", así que
+            # se estampa al final. Si se escribiera junto con la cabecera y
+            # después fallaran los items, _sb_estados_bulk vería tiene_raw=True
+            # y esta OC no se volvería a pedir nunca, quedando incompleta para
+            # siempre. Con sb_client cualquier fallo intermedio levanta, así que
+            # el testigo simplemente no llega a estamparse.
+            nuevo_hash = hdr.pop("raw_hash", None)
             _sb_upsert(T_HDR, "codigo_oc", [hdr])
             if items:
-                _sb_delete(T_ITEMS, "codigo_oc", cod)
-                _sb_upsert(T_ITEMS, "codigo_oc,line_no", items)
+                _reemplazar_items(cod, items)
+            if nuevo_hash:
+                _sb_upsert(T_HDR, "codigo_oc",
+                           [{"codigo_oc": cod, "raw_hash": nuevo_hash}])
             ok += 1
         except Exception as e:
             log.warning("Error detalle %s: %s", cod, repr(e))
@@ -277,16 +299,13 @@ def main():
 
     # Latido de frescura: sin esto nadie se entera si la ingesta se cae.
     # El panel de cartera observa data_freshness para decidir hasta que mes
-    # es publicable la serie de bookings.
-    try:
-        _sb_upsert("data_freshness", "dataset", [{
-            "dataset":      "mp_oc",
-            "refreshed_at": datetime.now(timezone.utc).isoformat(),
-            "rows_changed": ok,
-            "source":       "sync_oc.py",
-        }])
-    except Exception as e:
-        log.warning("No pude estampar data_freshness: %s", repr(e))
+    # es publicable la serie de bookings. stamp_freshness NO estampa si la
+    # corrida tuvo fallos: un latido fresco sobre una corrida rota es cómo un
+    # pipeline caído se ve verde durante días.
+    sb.stamp_freshness("mp_oc", ok, "sync_oc.py")
+
+    # Rojo si se perdió alguna escritura. `ok` ya cuenta sólo lo que entró.
+    sb.exit_si_hubo_fallos()
 
 if __name__ == "__main__":
     main()
