@@ -1,0 +1,56 @@
+# .github/workflows/ssa-sync.yml
+#
+# API de consulta de SSA (v1) → Supabase (ssa_ofs, ssa_actividades, ssa_asignaciones).
+#
+# Disparado por pg_cron vía workflow_dispatch, igual que mp-odoo.yml (ver
+# ssa_sync/sql/002_pg_cron.sql): incremental cada 20 min L-V en horario de planta
+# y un full diario a las 06:30 CL. Sin 'schedule' nativo a propósito.
+#
+# Concurrency propio: escribe en tablas distintas a las del sync de Odoo, así que
+# puede correr en paralelo con él, pero nunca dos veces consigo mismo.
+
+name: SSA → Supabase
+
+on:
+  workflow_dispatch:
+    inputs:
+      modo:
+        description: "probe = solo mira la forma de la API, no escribe"
+        type: choice
+        default: incremental
+        options:
+          - incremental
+          - full
+          - probe
+
+concurrency:
+  group: ssa-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: ssa_sync
+    env:
+      SSA_API_KEY:               ${{ secrets.SSA_API_KEY }}
+      SUPABASE_URL:              ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      SUPABASE_SERVICE_KEY:      ${{ secrets.SUPABASE_SERVICE_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Ejecutar
+        run: |
+          MODO="${{ inputs.modo || 'incremental' }}"
+          case "$MODO" in
+            full)  python sync_ssa_supabase.py --full ;;
+            probe) python sync_ssa_supabase.py --probe ;;
+            *)     python sync_ssa_supabase.py ;;
+          esac
