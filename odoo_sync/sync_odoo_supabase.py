@@ -2362,6 +2362,11 @@ def sync_crm_projects_incremental(odoo: OdooClient, chunk: int = 800) -> int:
         "x_studio_fecha_de_adjudicacin",
         "x_studio_fecha_estimada_de_compra",
         "x_studio_oc",
+        # FEOC = Fecha Estimada de la OC (date). Mientras la OC no llega es la
+        # promesa de Comercial; cuando llega queda como fecha de la OC. El
+        # embudo de OC del scorecard (v_kpi_oc_seguimiento) la usa para decir
+        # en qué mes debería aterrizar el colchón adjudicado y levantar atraso.
+        "x_studio_feoc",
         "x_studio_cantidad_de_vehculos",
         "x_studio_fme",
         "x_studio_efme",
@@ -2525,6 +2530,7 @@ def sync_crm_projects_incremental(odoo: OdooClient, chunk: int = 800) -> int:
                 "x_studio_fecha_de_adjudicacin":             parse_odoo_date(r.get("x_studio_fecha_de_adjudicacin")),
                 "x_studio_fecha_estimada_de_compra":         parse_odoo_date(r.get("x_studio_fecha_estimada_de_compra")),
                 "x_studio_oc":                               parse_odoo_bool(r.get("x_studio_oc")),
+                "x_studio_feoc":                             parse_odoo_date(r.get("x_studio_feoc")),
                 "x_studio_postulamos":                       parse_odoo_bool(r.get("x_studio_postulamos")),
                 "x_studio_activacin_preingreso":             parse_odoo_bool(r.get("x_studio_activacin_preingreso")),
                 "x_studio_fecha_de_activacin_de_preingreso": parse_odoo_dt(r.get("x_studio_fecha_de_activacin_de_preingreso")),
@@ -2679,6 +2685,9 @@ def backfill_crm_cierre_y_garantias(odoo: OdooClient, chunk: int = 500) -> int:
         "x_studio_multa_sobre", "x_studio_total_multa_en_",
         "x_studio_plazo_ofertado_en_dias", "x_studio_selection_field_435_1impo93op",
         "x_studio_condicin_termino_anticipado",
+        # FEOC (23-sep-2026): el incremental por write_date sólo la llena en las
+        # oportunidades que alguien edite; acá entra en las 3.4k de una pasada.
+        "x_studio_feoc",
     ]
     fields = available_fields(odoo, model, desired)
 
@@ -2753,6 +2762,9 @@ def backfill_crm_cierre_y_garantias(odoo: OdooClient, chunk: int = 500) -> int:
                 "x_studio_plazo_ofertado_en_dias":      r.get("x_studio_plazo_ofertado_en_dias"),
                 "x_studio_tipo_dias":                   sv(r.get("x_studio_selection_field_435_1impo93op")),
                 "x_studio_condicin_termino_anticipado": _clean_char(r.get("x_studio_condicin_termino_anticipado")),
+
+                # FEOC
+                "x_studio_feoc": parse_odoo_date(r.get("x_studio_feoc")),
             })
 
         if rows:
