@@ -40,7 +40,6 @@ ENTORNO
     SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY (o SUPABASE_SERVICE_KEY)
     SSA_OF_BATCH                      OFs por request en incremental (default 40)
 """
-import hashlib
 import json
 import os
 import sys
@@ -138,20 +137,49 @@ def as_int(v: Any) -> Optional[int]:
     except (TypeError, ValueError):
         return None
 
-OF_NAME_KEYS = ("of", "nombre", "of_nombre", "name", "codigo")
+# Los nombres de campo están CONFIRMADOS contra la API real (probe 23-09-2026).
+# Ojo con dos: el estado de la OF viene en `estado_of` (no `estado`), y las
+# fechas llegan SIN offset — son hora de planta, hay que estamparlas como -03:00
+# o Postgres las lee como UTC y quedan 3 horas corridas.
+
+TZ_PLANTA = ZoneInfo("America/Santiago")
+
+def ts(v: Any) -> Optional[str]:
+    """ISO de hora de planta (naive) → ISO con offset explícito."""
+    if not v:
+        return None
+    try:
+        d = datetime.fromisoformat(str(v))
+    except ValueError:
+        return None
+    return (d if d.tzinfo else d.replace(tzinfo=TZ_PLANTA)).isoformat()
+
+def boolean(v: Any) -> Optional[bool]:
+    return None if v is None else bool(v)
 
 def map_of(r: dict, run_ts: str) -> Optional[dict]:
     of_id = as_int(r.get("of_odoo_id"))
     if of_id is None:
         return None
     return {
-        "of_odoo_id": of_id,
-        "of_nombre": pick(r, *OF_NAME_KEYS),
+        "of_odoo_id": of_id,                       # negativo = OF virtual de SSA (CD/MANT/PLANTA)
+        "of_nombre": r.get("of"),
         "of_primaria_odoo_id": as_int(r.get("of_primaria_odoo_id")),
+        "of_primaria": r.get("of_primaria"),
+        "es_primaria": boolean(r.get("es_primaria")),
         "nota_venta_odoo_id": as_int(r.get("nota_venta_odoo_id")),
+        "nota_venta": r.get("nota_venta"),
         "lead_odoo_id": as_int(r.get("lead_odoo_id")),
         "cliente_odoo_id": as_int(r.get("cliente_odoo_id")),
-        "estado": pick(r, "estado", "state"),
+        "cliente_nombre": r.get("cliente_nombre"),
+        "proyecto": r.get("proyecto"),
+        "proyecto_etapa": r.get("proyecto_etapa"),
+        "producto": r.get("producto"),
+        "estado": r.get("estado_of"),
+        "cerrada_en_ssa": boolean(r.get("cerrada_en_ssa")),
+        "fecha_compromiso": r.get("fecha_compromiso"),
+        "cantidad_planificada": num(r.get("cantidad_planificada")),
+        "cantidad_producida": num(r.get("cantidad_producida")),
         "actividades": as_int(r.get("actividades")),
         "actividades_abiertas": as_int(r.get("actividades_abiertas")),
         "horas_planificadas": num(r.get("horas_planificadas")),
@@ -171,33 +199,48 @@ def map_act(r: dict, run_ts: str) -> Optional[dict]:
     if act_id is None:
         return None
     return {
-        "actividad_odoo_id": act_id,
+        "actividad_odoo_id": act_id,               # negativo = actividad no planificada
         "of_odoo_id": as_int(r.get("of_odoo_id")),
+        "of_primaria_odoo_id": as_int(r.get("of_primaria_odoo_id")),
+        "nota_venta_odoo_id": as_int(r.get("nota_venta_odoo_id")),
+        "lead_odoo_id": as_int(r.get("lead_odoo_id")),
         "centro_odoo_id": as_int(r.get("centro_odoo_id")),
-        "nombre": pick(r, "nombre", "actividad", "name"),
-        "estado": pick(r, "estado", "state"),
-        "no_planificada": bool(r.get("no_planificada")) if r.get("no_planificada") is not None else None,
-        "np_regularizado": bool(r.get("np_regularizado")) if r.get("np_regularizado") is not None else None,
+        "centro": r.get("centro"),
+        "nombre": r.get("actividad"),
+        "estado": r.get("estado"),
+        "cerrada": boolean(r.get("cerrada")),
+        "no_planificada": boolean(r.get("no_planificada")),
+        "np_regularizado": boolean(r.get("np_regularizado")),
+        "horas_unitarias": num(r.get("horas_unitarias")),
+        "unidades": num(r.get("unidades")),
+        "unidades_reconocidas": num(r.get("unidades_reconocidas")),
+        "factor": num(r.get("factor")),
+        "valor_congelado": num(r.get("valor_congelado")),
+        "asignaciones": as_int(r.get("asignaciones")),
+        "asignaciones_abiertas": as_int(r.get("asignaciones_abiertas")),
         "raw": r,
         "synced_at": run_ts,
     }
 
-ASG_ID_KEYS = ("asignacion_id", "id", "uuid", "asignacion_uuid")
-
 def map_asg(r: dict, run_ts: str, act_to_of: Dict[int, int]) -> dict:
-    key = pick(r, *ASG_ID_KEYS)
-    if key is None:  # llave estable derivada si la API no expone id propio
-        basis = [r.get("actividad_odoo_id"), r.get("colaborador_odoo_id"),
-                 pick(r, "emitida", "emitida_en", "fecha_emision", "fecha_asignacion")]
-        key = "h:" + hashlib.sha1(json.dumps(basis, default=str).encode()).hexdigest()[:24]
     act_id = as_int(r.get("actividad_odoo_id"))
-    of_id = as_int(r.get("of_odoo_id")) or (act_to_of.get(act_id) if act_id else None)
     return {
-        "asignacion_key": str(key),
+        "asignacion_key": str(r["asignacion_id"]),
         "actividad_odoo_id": act_id,
-        "of_odoo_id": of_id,
+        "actividad": r.get("actividad"),
+        "of_odoo_id": as_int(r.get("of_odoo_id")) or (act_to_of.get(act_id) if act_id else None),
+        "nota_venta_odoo_id": as_int(r.get("nota_venta_odoo_id")),
+        "lead_odoo_id": as_int(r.get("lead_odoo_id")),
+        "centro": r.get("centro"),
         "colaborador_odoo_id": as_int(r.get("colaborador_odoo_id")),
-        "estado": pick(r, "estado", "state"),
+        "emitida_por_odoo_id": as_int(r.get("emitida_por_odoo_id")),
+        "estado": r.get("estado"),
+        "resultado": r.get("resultado"),
+        "participacion": num(r.get("participacion")),
+        "completitud": num(r.get("completitud")),
+        "es_reasignacion": boolean(r.get("es_reasignacion")),
+        "emitida": ts(r.get("emitida")),            # ciclo real: emitida → cerrada
+        "cerrada": ts(r.get("cerrada")),
         "raw": r,
         "synced_at": run_ts,
     }
@@ -209,7 +252,7 @@ def redact(r: dict) -> dict:
     out = {}
     for k, v in r.items():
         low = k.lower()
-        out[k] = "<omitido>" if any(t in low for t in ("colaborador", "nombre_c", "operario", "persona", "codigo_interno")) and not low.endswith("odoo_id") else v
+        out[k] = "<omitido>" if any(t in low for t in ("colaborador", "emitida_por", "operario", "persona", "nombre_c", "codigo_interno")) and not low.endswith("odoo_id") else v
     return out
 
 def probe(api: SSA) -> None:
