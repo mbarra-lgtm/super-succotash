@@ -351,6 +351,10 @@ HERRAMIENTA = {
                            "description": "Registro exigido (REPE, Registro de Contratistas FF.AA., etc.)"},
             "procedimiento": {"type": ["string", "null"],
                               "description": "Como se piden o compran las bases, en una frase"},
+            "adjuntos": {"type": "array", "items": {"type": "string"},
+                         "description": "URLs completas de los PDF adjuntos que aparecen en la pagina "
+                                        "del aviso (/wp-content/uploads/...pdf). Llenalo siempre que la "
+                                        "pagina los muestre, aunque no hayas podido abrirlos."},
             "licitaciones": {
                 "type": "array",
                 "items": {
@@ -417,7 +421,8 @@ def extraer(aviso: dict, texto: str | None) -> tuple[dict | None, dict, str]:
         contenido = (f"Aviso: {aviso['titulo']}\nURL: {aviso['url']}\n\n"
                      "Abre la URL con web_fetch. Si es la pagina del aviso y el detalle esta en "
                      "un PDF adjunto (link a /wp-content/uploads/...pdf), abre tambien ese PDF. "
-                     "Luego registra el aviso con registrar_aviso.")
+                     "Luego registra el aviso con registrar_aviso, y pon en adjuntos los links a "
+                     "PDF que viste en la pagina.")
         fetch = {"type": "web_fetch_20250910", "name": "web_fetch", "max_uses": 3,
                  "max_content_tokens": 40000}
         if dominio:
@@ -612,10 +617,42 @@ def senal_pendiente(aviso: dict, doc_id, fuente: dict) -> dict:
 
 # ── Orquestación ────────────────────────────────────────────────────────────
 
+def _leido(reg: dict | None) -> bool:
+    return bool(reg and reg.get("lectura_ok") and reg.get("licitaciones") is not None)
+
+
+def extraer_aviso(aviso: dict, texto: str | None) -> tuple[dict | None, dict, str]:
+    """extraer() + segundo paso por el PDF adjunto.
+
+    Primera corrida real (13-10-2026, dry-run en Actions): web_fetch lee bien
+    los PDF directos, pero en las páginas /avisos/ el modelo veía el título y
+    la fecha y no abría el PDF adjunto (lectura_ok=false). Ahora la página
+    devuelve los links a PDF en `adjuntos` y el script los lee en una llamada
+    aparte, con la URL del PDF en el mensaje. La fecha de publicación se toma
+    de la página: los PDF no la traen.
+    """
+    reg, uso, metodo = extraer(aviso, texto)
+    if _leido(reg) or aviso["url"].lower().endswith(".pdf") or not reg:
+        return reg, uso, metodo
+    pdfs = [normalizar_url(u) for u in (reg.get("adjuntos") or [])
+            if ".pdf" in u.lower().split("?")[0] and u.startswith("http")]
+    for pdf in list(dict.fromkeys(pdfs))[:2]:
+        log.info("     leyendo PDF adjunto: %s", pdf)
+        reg2, uso2, _ = extraer({**aviso, "url": pdf}, None)
+        for k, v in uso2.items():
+            uso[k] = uso.get(k, 0) + v
+        if _leido(reg2):
+            if not reg2.get("fecha_publicacion") and reg.get("fecha_publicacion"):
+                reg2["fecha_publicacion"] = reg["fecha_publicacion"]
+            reg2["adjuntos"] = pdfs
+            return reg2, uso, "web_fetch_pdf"
+    return reg, uso, metodo
+
+
 def procesar_aviso(aviso: dict, fuente: dict, session: requests.Session, dry_run: bool) -> tuple[int, dict]:
     log.info("   · %s", aviso["url"])
     texto = leer_directo(aviso["url"], session)
-    reg, uso, metodo = extraer(aviso, texto)
+    reg, uso, metodo = extraer_aviso(aviso, texto)
     ahora = datetime.now(timezone.utc).isoformat()
     org = (reg or {}).get("organismo") if (reg or {}).get("organismo") in CORTO \
         else _org_desde_titulo(aviso["titulo"])
@@ -624,7 +661,7 @@ def procesar_aviso(aviso: dict, fuente: dict, session: requests.Session, dry_run
         log.info("     [dry-run] %s", json.dumps(reg, ensure_ascii=False)[:1500])
         return len((reg or {}).get("licitaciones") or []), uso
 
-    leido = bool(reg and reg.get("lectura_ok") and reg.get("licitaciones") is not None)
+    leido = _leido(reg)
     resumen_doc = json.dumps(reg, ensure_ascii=False) if reg else None
     cambios = {"extraction_method": metodo, "extracted_text": (texto or resumen_doc or "")[:200000] or None,
                "tokens_in": uso.get("input_tokens"), "tokens_out": uso.get("output_tokens"),
