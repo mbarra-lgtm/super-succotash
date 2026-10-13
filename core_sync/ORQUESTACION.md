@@ -47,6 +47,47 @@ hospital"*. Por eso `filtrar_nota()` calcula
 El factor 2 se calibra con `core_senal_feedback`. Si aparecen falsos negativos,
 bajarlo antes que borrar keywords negativas.
 
+## Tercera vía: avisos legales de Defensa
+
+`ingesta_avisos_defensa.py` (13-10-2026). El Ejército, la Armada y la FACh
+compran fuera de Mercado Público todo lo financiado por la Ley 21.174 y lo
+excluido por la Ley 19.886: lo anuncian como aviso legal en
+diarioavisoslegales.cl y El Mercurio. El espejo MP no lo ve nunca.
+
+```
+Google News RSS ──> URL real ──> aviso + PDF ──> Claude ──> core_senales
+ (4 consultas)      (batch-      (directo o      (tabla)    (1 por licitación,
+                     execute)     web_fetch)                  fecha_limite + contacto)
+```
+
+| | Prensa | Avisos de Defensa |
+|---|---|---|
+| Qué dice el título | El hecho | Nada: "LLAMADO A PROPUESTA PÚBLICA – EJÉRCITO DE CHILE" |
+| Dónde está el dato | Titular y bajada | Tabla en un PDF: número, rubro, correo, cierre |
+| Filtro | Keywords, negativo pesa doble | Ninguno: se lee cada aviso (2-4 al mes) |
+| Lectura | No se baja la nota | Se lee el PDF con `web_fetch` (Cloudflare bloquea el GET directo) |
+| Dato que manda | Monto | Cierre de solicitud de bases → `core_senales.fecha_limite` |
+
+Cosas que hay que saber:
+
+- **Sin REPE no hay bases.** El Ejército entrega bases sólo a empresas
+  inscritas, habilitadas y vigentes en el Registro Especial de Proveedores del
+  Ejército; la Armada y la FACh tienen sus propios registros.
+- **El "encaje" entra como prioridad** en `fn_core_score` (alto=1, medio=3,
+  bajo=5): con etapa licitación, encaje alto ≈ 57 (correo a todos), medio ≈ 46
+  (comercial), bajo ≈ 33 (sólo panel). La mayoría de los llamados son botas,
+  repuestos y aviación: encaje bajo, no llegan al correo.
+- **Un aviso que no se pudo leer igual se avisa** (score ≈ 37, sólo a quien
+  tiene umbral 35) y se reintenta 21 días. Cuando se lee, la señal pendiente se
+  descarta sola y entran las licitaciones.
+- **Dedupe por número + correo**: el mismo llamado se publica 2 días seguidos
+  y en página y PDF; DIVMANT y Aviación usan la misma numeración (07-2026).
+  Si se republica con otra fecha límite, se corre `fecha_limite` (prórroga).
+- `acuerdo_numero` guarda el número de licitación; `v_core_defensa_llamados`
+  lista los llamados con días para el cierre.
+- Un aviso puntual se carga a mano con
+  `python ingesta_avisos_defensa.py --url <url del aviso o del PDF>`.
+
 ## Secretos
 
 Además de los de `mp_sync` (`SUPABASE_URL`, `SUPABASE_SERVICE_KEY`), este
@@ -60,7 +101,7 @@ pipeline necesita uno nuevo:
 
 | Archivo | Cadencia (UTC) | Scripts |
 |---|---|---|
-| `core-radar.yml` | 11:00 y 23:00 L-V (≈07:00 y 19:00 CL) | `scrape_core.py` + `clasificar_senales.py` |
+| `core-radar.yml` | 11:00 y 23:00 L-V (≈07:00 y 19:00 CL) | `scrape_core.py` + `clasificar_senales.py` + `ingesta_prensa.py` + `ingesta_avisos_defensa.py` |
 
 La cadencia real por fuente la decide la base: `core_sources.frecuencia_horas`
 (12 h para regiones prioritarias, 24 h para el resto). El workflow solo pregunta
@@ -81,6 +122,7 @@ La cadencia real por fuente la decide la base: `core_sources.frecuencia_horas`
 | `fn_core_score()` | Score 0-100 = etapa(40) + tamaño(25) + prioridad organismo(20) + confianza(15) |
 | `v_core_radar_diario` | Lo detectado ayer, para el correo |
 | `v_core_fuentes_salud` | Semáforo por fuente |
+| `v_core_defensa_llamados` | Llamados de Defensa con número, cierre, días para el cierre y correo |
 
 ## Lo que enseñó el piloto
 
