@@ -64,3 +64,11 @@ jobs:
         if: ${{ !cancelled() && !inputs.slug }}
         run: |
           python ingesta_prensa.py ${{ inputs.dry_run && '--dry-run' || '' }}
+
+            # Llamados de Ejército, Armada y FACh fuera de Mercado Público (avisos
+      # legales). diarioavisoslegales.cl está detrás de Cloudflare: se descubre
+      # por Google News y el PDF lo lee la API de Anthropic con web_fetch.
+      - name: Avisos de Defensa
+        if: ${{ !cancelled() && !inputs.slug }}
+        run: |
+          python ingesta_avisos_defensa.py ${{ inputs.dry_run && '--dry-run' || '' }}
