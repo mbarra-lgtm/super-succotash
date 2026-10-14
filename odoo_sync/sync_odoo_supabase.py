@@ -603,6 +603,8 @@ def sync_account_move_lines_full_resync(
         "reconciled", "full_reconcile_id",
         "amount_residual", "amount_residual_currency",
         "matched_debit_ids", "matched_credit_ids",
+        # Seguimiento P0: enlace exacto línea de factura → línea / cabecera de OC
+        "purchase_line_id", "purchase_order_id",
         "write_date",
     ]
     fields = available_fields(odoo, model, desired)
@@ -660,6 +662,8 @@ def sync_account_move_lines_full_resync(
             product_id, _ = m2o(r.get("product_id"))
             tax_line_id, _ = m2o(r.get("tax_line_id"))
             full_reconcile_id, _ = m2o(r.get("full_reconcile_id"))
+            purchase_line_id, _ = m2o(r.get("purchase_line_id"))
+            purchase_order_id, _ = m2o(r.get("purchase_order_id"))
  
             account_code = None
             account_name = None
@@ -708,6 +712,8 @@ def sync_account_move_lines_full_resync(
                 "amount_residual_currency": _coerce_num(r.get("amount_residual_currency")),
                 "matched_debit_ids": _coerce_id_list(r.get("matched_debit_ids")),
                 "matched_credit_ids": _coerce_id_list(r.get("matched_credit_ids")),
+                "purchase_line_id": purchase_line_id,
+                "purchase_order_id": purchase_order_id,
                 "write_date": parse_odoo_dt(r.get("write_date")),
                 "last_seen_at": run_ts_iso,
                 "is_active": True,
@@ -728,6 +734,7 @@ def sync_account_move_lines_full_resync(
                 "reconciled", "full_reconcile_id",
                 "amount_residual", "amount_residual_currency",
                 "matched_debit_ids", "matched_credit_ids",
+                "purchase_line_id", "purchase_order_id",
                 "write_date", "is_active", "missing_since",
             ])
  
@@ -4505,6 +4512,10 @@ def sync_purchase_order_lines_incremental(odoo: OdooClient, chunk: int = 1200) -
     desired = [
         "id","order_id","state",
         "product_id","name","product_qty","qty_received",
+        # Seguimiento P0: tercera cantidad (facturado) y la brecha que Odoo ya
+        # calcula (qty_to_invoice = recibido − facturado, o pedido − facturado
+        # si la política de facturación es "cantidades pedidas").
+        "qty_invoiced","qty_to_invoice",
         "price_unit","price_subtotal","price_total",
         "date_planned",
         "currency_id","company_id",
@@ -4541,6 +4552,8 @@ def sync_purchase_order_lines_incremental(odoo: OdooClient, chunk: int = 1200) -
                 "line_name": r.get("name"),
                 "product_qty": r.get("product_qty"),
                 "qty_received": r.get("qty_received"),
+                "qty_invoiced": r.get("qty_invoiced"),
+                "qty_to_invoice": r.get("qty_to_invoice"),
                 "price_unit": r.get("price_unit"),
                 "price_subtotal": r.get("price_subtotal"),
                 "price_total": r.get("price_total"),
@@ -4558,6 +4571,69 @@ def sync_purchase_order_lines_incremental(odoo: OdooClient, chunk: int = 1200) -
 
     print(f"✅ purchase_order_lines incremental: {total} filas (desde write_date>{last})")
     return total
+
+
+def refresh_purchase_order_lines_facturacion(
+    odoo: OdooClient,
+    alcance: str = "abiertas",
+    chunk_ids: int = 1000,
+) -> int:
+    """
+    Re-lee qty_invoiced / qty_to_invoice de las líneas de OC ya espejadas.
+
+    Por qué existe: qty_invoiced es un campo computado almacenado que Odoo
+    recalcula cuando se publica, revierte o edita una factura de proveedor.
+    No hay garantía de que ese recálculo mueva write_date de la línea, así que
+    el incremental por write_date podría dejarla desfasada. Este refresco lo
+    cubre sin depender de write_date.
+
+    alcance:
+      'abiertas' → cada ciclo. Líneas de OC confirmadas que aún no calzan
+                   (qty_invoiced nulo, qty_to_invoice ≠ 0 o la OC no está
+                   'invoiced'). Son pocas miles.
+      'todas'    → 1x al día. Todas las líneas de OC confirmadas (~20k).
+                   También sirve como backfill inicial de las columnas nuevas.
+
+    Solo ACTUALIZA filas existentes (RPC rpc_pol_facturacion_update): nunca
+    inserta líneas a medias. Las líneas nuevas entran por el incremental normal.
+    """
+    res = sb.rpc("rpc_pol_ids_refresh_facturacion", {"p_alcance": alcance}).execute()
+    err = getattr(res, "error", None)
+    if err:
+        raise RuntimeError(f"rpc_pol_ids_refresh_facturacion error: {err}")
+    data = getattr(res, "data", None)
+    ids = uniq_ints(data or []) if isinstance(data, list) else []
+    if not ids:
+        print(f"✅ purchase_order_lines facturación ({alcance}): nada que refrescar")
+        return 0
+
+    fields = available_fields(odoo, "purchase.order.line", ["id", "qty_invoiced", "qty_to_invoice"])
+    if "qty_invoiced" not in fields:
+        print("⚠️ purchase.order.line sin qty_invoiced en este Odoo: se omite el refresco")
+        return 0
+
+    leidas = 0
+    cambiadas = 0
+    for part in chunked(ids, chunk_ids):
+        batch = odoo.search_read(
+            "purchase.order.line",
+            [["id", "in", part]],
+            fields,
+            limit=100000,
+            offset=0,
+            order="id asc",
+            context={"active_test": False},
+        ) or []
+        rows = [{
+            "odoo_id": int(r["id"]),
+            "qty_invoiced": r.get("qty_invoiced"),
+            "qty_to_invoice": r.get("qty_to_invoice"),
+        } for r in batch]
+        leidas += len(rows)
+        cambiadas += sb_rpc_upsert("rpc_pol_facturacion_update", rows, batch_size=1000)
+
+    print(f"✅ purchase_order_lines facturación ({alcance}): leídas={leidas} de {len(ids)} | cambiadas={cambiadas}")
+    return cambiadas
 
 
 # =========================
@@ -4889,6 +4965,9 @@ def sync_account_move_lines_incremental(odoo: OdooClient, run_ts_iso: str, chunk
         # NUEVOS — respaldo para calcular residual cuando Odoo devuelve null
         "matched_debit_ids",
         "matched_credit_ids",
+        # Seguimiento P0: enlace exacto línea de factura → línea / cabecera de OC
+        "purchase_line_id",
+        "purchase_order_id",
         "write_date",
     ]
     fields = available_fields(odoo, model, desired)
@@ -4956,6 +5035,8 @@ def sync_account_move_lines_incremental(odoo: OdooClient, run_ts_iso: str, chunk
             product_id, _product_name = m2o(r.get("product_id"))
             tax_line_id, _tax_line_name = m2o(r.get("tax_line_id"))
             full_reconcile_id, _full_reconcile_name = m2o(r.get("full_reconcile_id"))
+            purchase_line_id, _ = m2o(r.get("purchase_line_id"))
+            purchase_order_id, _ = m2o(r.get("purchase_order_id"))
  
             account_code = None
             account_name = None
@@ -5022,6 +5103,10 @@ def sync_account_move_lines_incremental(odoo: OdooClient, run_ts_iso: str, chunk
                 # NUEVOS
                 "matched_debit_ids": matched_debit_ids,
                 "matched_credit_ids": matched_credit_ids,
+
+                # Seguimiento P0
+                "purchase_line_id": purchase_line_id,
+                "purchase_order_id": purchase_order_id,
  
                 "write_date": parse_odoo_dt(r.get("write_date")),
  
@@ -5062,6 +5147,8 @@ def sync_account_move_lines_incremental(odoo: OdooClient, run_ts_iso: str, chunk
                 "amount_residual_currency",
                 "matched_debit_ids",
                 "matched_credit_ids",
+                "purchase_line_id",
+                "purchase_order_id",
                 "write_date",
                 "is_active",
                 "missing_since",
@@ -5925,6 +6012,24 @@ def main():
         sync_purchase_order_lines_incremental(odoo, chunk=1200)
     except Exception as e:
         print(f"⚠️ purchase_order_lines incremental: {e}")
+
+    # Seguimiento P0: qty_invoiced / qty_to_invoice. 'abiertas' en cada ciclo,
+    # 'todas' 1x al día (también hace el backfill inicial de las columnas).
+    try:
+        now_local = datetime.now(TZ_LOCAL)
+        import tempfile
+        sentinel_polf = os.path.join(
+            tempfile.gettempdir(),
+            f"pol_facturacion_full_{now_local.date().isoformat()}.done"
+        )
+        if FORCE_FULL_RESYNC or (not SKIP_FULL_RESYNC and now_local.hour >= PURCHASE_FULL_RESYNC_HOUR and not os.path.exists(sentinel_polf)):
+            refresh_purchase_order_lines_facturacion(odoo, alcance="todas")
+            with open(sentinel_polf, "w") as f:
+                f.write(now_local.isoformat())
+        else:
+            refresh_purchase_order_lines_facturacion(odoo, alcance="abiertas")
+    except Exception as e:
+        print(f"⚠️ purchase_order_lines facturación: {e}")
 
     try:
         sync_sale_order_lines_incremental(odoo, chunk=1200)
