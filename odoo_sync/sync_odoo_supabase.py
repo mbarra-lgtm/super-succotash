@@ -108,6 +108,13 @@ ETT_BACKFILL_PREFIX = os.getenv("ETT_BACKFILL_PREFIX", "").strip() or None
 # 1 = propaga también las fichas borradas en Odoo (recorre TODOS los templates).
 ETT_BACKFILL_ALL    = os.getenv("ETT_BACKFILL_ALL", "0").strip() == "1"
 
+# Ubicación en bodega (m2m x_studio_ubicacin_en_bodega -> x_ubicaciones_bodega).
+# Mismo esquema que EETT: incremental siempre, backfill en el full diario.
+# FORCE_UBIC_BACKFILL=1 lo dispara a mano (primera corrida tras crear columnas).
+# UBIC_BACKFILL_ALL=1 recorre TODOS los templates y propaga bins borrados.
+FORCE_UBIC_BACKFILL = os.getenv("FORCE_UBIC_BACKFILL", "0").strip() == "1"
+UBIC_BACKFILL_ALL   = os.getenv("UBIC_BACKFILL_ALL", "0").strip() == "1"
+
 # =========================
 # Tables
 # =========================
@@ -1965,11 +1972,39 @@ def ett_cols(r: dict, fields: List[str]) -> Dict[str, Optional[str]]:
             out[col] = _ett_clean(r.get(odoo_field))
     return out
 
+
+# -------------------------
+# Ubicación en bodega (bins) — many2many Studio sobre product.template
+# -------------------------
+# Campo x_studio_ubicacin_en_bodega (sic, la "ó" viene caída desde Studio) que
+# apunta al modelo custom x_ubicaciones_bodega (etiquetas tipo "2B-161"). NO es
+# stock.location: los quants siguen saliendo de stock_quants; esto es la
+# ubicación física "nominal" que Bodega etiqueta a mano en la ficha.
+# Se guarda en dos columnas: ids (para joins / filtros exactos) y nombres
+# (para mostrar sin resolver nada). product.product lo hereda del template.
+UBIC_ODOO_FIELD = "x_studio_ubicacin_en_bodega"
+UBIC_MODEL      = "x_ubicaciones_bodega"
+UBIC_COL_IDS    = "ubicacion_bodega_ids"
+UBIC_COL_NAMES  = "ubicacion_bodega"
+
+
+def ubic_cols(odoo: "OdooClient", r: dict, fields: List[str]) -> Dict[str, Any]:
+    """Columnas de ubicación en bodega de una fila. Dict vacío si el campo no existe
+    en el modelo (misma lógica que ett_cols: no pisar con NULL lo ya cargado).
+    Sin etiquetas en Odoo -> ambas columnas NULL (sí se propaga el borrado)."""
+    if UBIC_ODOO_FIELD not in fields:
+        return {}
+    ids = uniq_ints(r.get(UBIC_ODOO_FIELD) or [])
+    if not ids:
+        return {UBIC_COL_IDS: None, UBIC_COL_NAMES: None}
+    names = m2m_names(odoo, UBIC_MODEL, ids)
+    return {UBIC_COL_IDS: ids, UBIC_COL_NAMES: names}
+
 def sync_product_products_incremental(odoo: OdooClient, chunk: int = 800) -> int:
     model = "product.product"
     table = TB_PRODUCTS
 
-    desired = ["id", "default_code", "name", "barcode", "active", "write_date", "standard_price", "product_tmpl_id"] + ETT_ODOO_FIELDS
+    desired = ["id", "default_code", "name", "barcode", "active", "write_date", "standard_price", "product_tmpl_id"] + ETT_ODOO_FIELDS + [UBIC_ODOO_FIELD]
     fields = available_fields(odoo, model, desired)
 
     domain: list = []
@@ -2001,6 +2036,7 @@ def sync_product_products_incremental(odoo: OdooClient, chunk: int = 800) -> int
                 "write_date": parse_odoo_dt(r.get("write_date")),
                 "product_tmpl_id": tmpl_id,   # ✅ clave
                 **ett_cols(r, fields),        # ✅ EETT heredada del template
+                **ubic_cols(odoo, r, fields), # ✅ ubicación en bodega (heredada)
             })
 
             _PRODUCT_CACHE[pid] = {
@@ -2089,7 +2125,7 @@ def sync_product_templates_incremental(odoo: OdooClient, chunk: int = 800) -> in
         "categ_id",
         "standard_price",
         "write_date",
-    ] + ETT_ODOO_FIELDS
+    ] + ETT_ODOO_FIELDS + [UBIC_ODOO_FIELD]
     fields = available_fields(odoo, model, desired)
 
     domain: list = []
@@ -2124,7 +2160,8 @@ def sync_product_templates_incremental(odoo: OdooClient, chunk: int = 800) -> in
                 "categ_name": categ_name,
                 "standard_price": r.get("standard_price"),
                 "write_date": parse_odoo_dt(r.get("write_date")),
-                **ett_cols(r, fields),   # ✅ EETT
+                **ett_cols(r, fields),         # ✅ EETT
+                **ubic_cols(odoo, r, fields),  # ✅ ubicación en bodega
             })
 
         sb_upsert_basic(table, rows, on_conflict="odoo_id", batch_size=1000)
@@ -2176,7 +2213,7 @@ def backfill_product_templates_from_products(odoo: OdooClient, chunk_ids: int = 
     desired = [
         "id","name","default_code","barcode","active","type",
         "uom_id","uom_po_id","categ_id","write_date"
-    ] + ETT_ODOO_FIELDS
+    ] + ETT_ODOO_FIELDS + [UBIC_ODOO_FIELD]
     fields = available_fields(odoo, "product.template", desired)
 
     rows: List[dict] = []
@@ -2210,7 +2247,8 @@ def backfill_product_templates_from_products(odoo: OdooClient, chunk_ids: int = 
                 "categ_id": categ_id,
                 "categ_name": categ_name,
                 "write_date": parse_odoo_dt(r.get("write_date")),
-                **ett_cols(r, fields),   # ✅ EETT
+                **ett_cols(r, fields),         # ✅ EETT
+                **ubic_cols(odoo, r, fields),  # ✅ ubicación en bodega
             })
 
     sb_upsert_basic(TB_PRODUCT_TEMPLATES, rows, on_conflict="odoo_id", batch_size=1000)
@@ -2303,6 +2341,79 @@ def backfill_product_ett(
 
     print(f"✅ EETT backfill: {len(tmpl_rows)} templates | {len(variant_rows)} variants "
           f"| only_filled={only_filled} | prefix={default_code_prefix or '—'}")
+    return {"templates": len(tmpl_rows), "variants": len(variant_rows)}
+
+
+# =========================
+# Ubicación en bodega: backfill completo
+# =========================
+def backfill_product_ubicaciones(
+    odoo: OdooClient,
+    chunk: int = 1000,
+    only_filled: bool = True,
+) -> dict:
+    """Recorre product.template y baja SOLO la ubicación en bodega al espejo.
+
+    Misma razón que backfill_product_ett: el incremental avanza por write_date y
+    los productos que ya tenían bins etiquetados antes de crear las columnas no
+    vuelven a pasar hasta que alguien los toque en Odoo. Odoo tampoco actualiza
+    write_date del template cuando solo cambia una m2m en algunos casos, así que
+    este backfill en el full diario es la red de seguridad.
+
+    Args:
+        only_filled: True (default) trae solo templates con al menos un bin.
+            False recorre todos y propaga también los bins borrados.
+
+    Devuelve: {"templates": n, "variants": n}
+    """
+    model = "product.template"
+    fields = available_fields(odoo, model, ["id", "write_date", UBIC_ODOO_FIELD])
+    if UBIC_ODOO_FIELD not in fields:
+        print(f"⏭️  Ubicaciones backfill: {UBIC_ODOO_FIELD} no existe en product.template")
+        return {"templates": 0, "variants": 0}
+
+    domain: list = []
+    if only_filled:
+        domain.append([UBIC_ODOO_FIELD, "!=", False])
+
+    tmpl_rows: List[dict] = []
+    ubic_by_tmpl: Dict[int, Dict[str, Any]] = {}
+
+    for batch in iter_search_read_all(odoo, model, domain, fields, chunk=chunk, context={"active_test": False}):
+        for r in batch:
+            tid = int(r["id"])
+            cols = ubic_cols(odoo, r, fields)
+            ubic_by_tmpl[tid] = cols
+            tmpl_rows.append({"odoo_id": tid, **cols})
+
+    if not tmpl_rows:
+        print("✅ Ubicaciones backfill: no hay templates con bins para bajar")
+        return {"templates": 0, "variants": 0}
+
+    sb_upsert_basic(TB_PRODUCT_TEMPLATES, tmpl_rows, on_conflict="odoo_id", batch_size=1000)
+
+    # Propagar al variant vía product_products.product_tmpl_id (ya está en el espejo).
+    variant_rows: List[dict] = []
+    for part in chunked(list(ubic_by_tmpl.keys()), 500):
+        res = (
+            sb.table(TB_PRODUCTS)
+            .select("odoo_id,product_tmpl_id")
+            .in_("product_tmpl_id", part)
+            .execute()
+        )
+        err = getattr(res, "error", None)
+        if err:
+            raise RuntimeError(f"Supabase error leyendo variants por template: {err}")
+        for row in (getattr(res, "data", None) or []):
+            cols = ubic_by_tmpl.get(int(row["product_tmpl_id"]))
+            if cols:
+                variant_rows.append({"odoo_id": int(row["odoo_id"]), **cols})
+
+    if variant_rows:
+        sb_upsert_basic(TB_PRODUCTS, variant_rows, on_conflict="odoo_id", batch_size=1000)
+
+    print(f"✅ Ubicaciones backfill: {len(tmpl_rows)} templates | {len(variant_rows)} variants "
+          f"| only_filled={only_filled}")
     return {"templates": len(tmpl_rows), "variants": len(variant_rows)}
 
 
@@ -5856,6 +5967,15 @@ def main():
             print("⏭️  EETT backfill: skip (job frecuente)")
     except Exception as e:
         print(f"⚠️ EETT backfill: {e}")
+
+    # Ubicación en bodega: misma red de seguridad que EETT (solo full diario).
+    try:
+        if FORCE_UBIC_BACKFILL or FORCE_FULL_RESYNC or not SKIP_FULL_RESYNC:
+            backfill_product_ubicaciones(odoo, chunk=1000, only_filled=not UBIC_BACKFILL_ALL)
+        else:
+            print("⏭️  Ubicaciones backfill: skip (job frecuente)")
+    except Exception as e:
+        print(f"⚠️ Ubicaciones backfill: {e}")
 
     try:
         sync_stock_quants_incremental(odoo, run_ts_iso, chunk=1000)
