@@ -2583,9 +2583,10 @@ def sync_crm_projects_incremental(odoo: OdooClient, chunk: int = 800) -> int:
         "x_studio_plazo_ofertado_en_dias",
         "x_studio_selection_field_435_1impo93op",  # "Tipo Días" -> col x_studio_tipo_dias
         "x_studio_condicin_termino_anticipado",
+        "x_studio_valor_chasis_ofertado",          # integer "Valor Neto Chasis Ofertado" (22-oct-2026)
     ]
     fields = available_fields(odoo, model, desired)
- 
+
     last = sb_get_max_write_date(table)
     domain: list = []
     if last:
@@ -2763,6 +2764,8 @@ def sync_crm_projects_incremental(odoo: OdooClient, chunk: int = 800) -> int:
                 "x_studio_plazo_ofertado_en_dias":      r.get("x_studio_plazo_ofertado_en_dias"),
                 "x_studio_tipo_dias":                   sv(r.get("x_studio_selection_field_435_1impo93op")),  # ALIAS
                 "x_studio_condicin_termino_anticipado": _clean_char(r.get("x_studio_condicin_termino_anticipado")),
+                # Odoo integer: 0 = sin llenar -> NULL en el espejo
+                "x_studio_valor_chasis_ofertado":       r.get("x_studio_valor_chasis_ofertado") or None,
             })
  
         sb_upsert_basic(table, rows, on_conflict="odoo_id", batch_size=1000)
@@ -2807,6 +2810,9 @@ def backfill_crm_cierre_y_garantias(odoo: OdooClient, chunk: int = 500) -> int:
         "x_studio_multa_sobre", "x_studio_total_multa_en_",
         "x_studio_plazo_ofertado_en_dias", "x_studio_selection_field_435_1impo93op",
         "x_studio_condicin_termino_anticipado",
+        # Valor Neto Chasis Ofertado (22-oct-2026): mismo caso que FEOC, el full
+        # diario la rellena en todas las oportunidades de una pasada.
+        "x_studio_valor_chasis_ofertado",
         # FEOC (23-sep-2026): el incremental por write_date sólo la llena en las
         # oportunidades que alguien edite; acá entra en las 3.4k de una pasada.
         "x_studio_feoc",
@@ -2888,6 +2894,7 @@ def backfill_crm_cierre_y_garantias(odoo: OdooClient, chunk: int = 500) -> int:
                 "x_studio_plazo_ofertado_en_dias":      r.get("x_studio_plazo_ofertado_en_dias"),
                 "x_studio_tipo_dias":                   sv(r.get("x_studio_selection_field_435_1impo93op")),
                 "x_studio_condicin_termino_anticipado": _clean_char(r.get("x_studio_condicin_termino_anticipado")),
+                "x_studio_valor_chasis_ofertado":       r.get("x_studio_valor_chasis_ofertado") or None,
 
                 # FEOC
                 "x_studio_feoc":     parse_odoo_date(r.get("x_studio_feoc")),
