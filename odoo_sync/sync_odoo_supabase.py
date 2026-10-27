@@ -160,6 +160,8 @@ TB_BOM_LINES  = "mrp_bom_lines"
 TB_WORKCENTERS         = "mrp_workcenters"
 TB_ROUTING_WORKCENTERS = "mrp_routing_workcenters"
 TB_ECO        = "mrp_ecos"
+TB_ECO_APPROVALS  = "mrp_eco_approvals"    # mrp.eco.approval (KPI Modulación)
+TB_ECO_STAGE_HIST = "mrp_eco_stage_hist"   # cambios de etapa de mrp.eco
 TB_PICKINGS   = "stock_pickings"
 TB_PICKING_BATCHES = "stock_picking_batches"
 TB_MOVES      = "stock_moves"
@@ -994,6 +996,36 @@ def sb_get_max_write_date(table: str) -> Optional[str]:
     if not data:
         return None
     return data[0].get("write_date")
+
+
+_SB_COL_CACHE: Dict[Tuple[str, str], bool] = {}
+
+def sb_has_column(table: str, col: str) -> bool:
+    """True si la columna existe en Supabase. Permite subir el sync antes que la
+    migración sin romper el upsert (PostgREST rechaza columnas desconocidas)."""
+    key = (table, col)
+    if key not in _SB_COL_CACHE:
+        try:
+            res = sb.table(table).select(col).limit(1).execute()
+            _SB_COL_CACHE[key] = getattr(res, "error", None) is None
+        except Exception:
+            _SB_COL_CACHE[key] = False
+        if not _SB_COL_CACHE[key]:
+            print(f"⏭️  {table}.{col} no existe en Supabase (¿falta la migración 20261027_mod_kpi?)")
+    return _SB_COL_CACHE[key]
+
+
+def creacion_cols(r: dict, fields: List[str], table: str) -> Dict[str, Any]:
+    """create_date / create_uid / create_uid_name, solo si Odoo los entregó y la
+    tabla ya tiene las columnas. Usado por product_templates y mrp_ecos."""
+    out: Dict[str, Any] = {}
+    if "create_date" in fields and sb_has_column(table, "create_date"):
+        out["create_date"] = parse_odoo_dt(r.get("create_date"))
+    if "create_uid" in fields and sb_has_column(table, "create_uid"):
+        uid, uname = m2o(r.get("create_uid"))
+        out["create_uid"] = uid
+        out["create_uid_name"] = uname
+    return out
 
 
 # =========================
@@ -2159,6 +2191,8 @@ def sync_product_templates_incremental(odoo: OdooClient, chunk: int = 800) -> in
         "categ_id",
         "standard_price",
         "write_date",
+        "create_date",   # ✅ KPI Modulación: quién y cuándo creó el producto
+        "create_uid",
     ] + ETT_ODOO_FIELDS + [UBIC_ODOO_FIELD]
     fields = available_fields(odoo, model, desired)
 
@@ -2194,6 +2228,7 @@ def sync_product_templates_incremental(odoo: OdooClient, chunk: int = 800) -> in
                 "categ_name": categ_name,
                 "standard_price": r.get("standard_price"),
                 "write_date": parse_odoo_dt(r.get("write_date")),
+                **creacion_cols(r, fields, table),  # ✅ creación (KPI Modulación)
                 **ett_cols(r, fields),         # ✅ EETT
                 **ubic_cols(odoo, r, fields),  # ✅ ubicación en bodega
             })
@@ -2246,7 +2281,8 @@ def backfill_product_templates_from_products(odoo: OdooClient, chunk_ids: int = 
     # 3) pedirlos a Odoo y upsert
     desired = [
         "id","name","default_code","barcode","active","type",
-        "uom_id","uom_po_id","categ_id","write_date"
+        "uom_id","uom_po_id","categ_id","write_date",
+        "create_date","create_uid",
     ] + ETT_ODOO_FIELDS + [UBIC_ODOO_FIELD]
     fields = available_fields(odoo, "product.template", desired)
 
@@ -2281,6 +2317,7 @@ def backfill_product_templates_from_products(odoo: OdooClient, chunk_ids: int = 
                 "categ_id": categ_id,
                 "categ_name": categ_name,
                 "write_date": parse_odoo_dt(r.get("write_date")),
+                **creacion_cols(r, fields, TB_PRODUCT_TEMPLATES),  # ✅ creación
                 **ett_cols(r, fields),         # ✅ EETT
                 **ubic_cols(odoo, r, fields),  # ✅ ubicación en bodega
             })
@@ -2288,6 +2325,63 @@ def backfill_product_templates_from_products(odoo: OdooClient, chunk_ids: int = 
     sb_upsert_basic(TB_PRODUCT_TEMPLATES, rows, on_conflict="odoo_id", batch_size=1000)
     print(f"✅ product_templates backfill desde product_products: {len(rows)}")
     return len(rows)
+
+
+# =========================
+# Creación de product.template: backfill (KPI Modulación)
+# =========================
+def backfill_product_templates_creacion(odoo: OdooClient, chunk_ids: int = 1000,
+                                        limit_ids: int = 50000) -> int:
+    """Llena create_date / create_uid / create_uid_name en los templates que ya
+    estaban en el espejo antes de agregar las columnas.
+
+    Idempotente: lee de Supabase los que tienen create_date NULL (paginando por
+    odoo_id, PostgREST corta en 1.000 filas) y se los pide a Odoo. Cuando termina
+    queda en no-op, así que puede correr en todos los ciclos.
+    """
+    if not sb_has_column(TB_PRODUCT_TEMPLATES, "create_uid"):
+        return 0
+
+    ids: List[int] = []
+    last_id = 0
+    while len(ids) < limit_ids:
+        res = (
+            sb.table(TB_PRODUCT_TEMPLATES)
+            .select("odoo_id")
+            .is_("create_date", "null")
+            .gt("odoo_id", last_id)
+            .order("odoo_id")
+            .limit(1000)
+            .execute()
+        )
+        err = getattr(res, "error", None)
+        if err:
+            raise RuntimeError(f"Supabase error leyendo templates sin create_date: {err}")
+        data = getattr(res, "data", None) or []
+        if not data:
+            break
+        ids.extend(int(r["odoo_id"]) for r in data)
+        last_id = ids[-1]
+
+    if not ids:
+        print("✅ product_templates creación: nada pendiente")
+        return 0
+
+    fields = available_fields(odoo, "product.template", ["id", "create_date", "create_uid"])
+    total = 0
+    for part in chunked(ids, chunk_ids):
+        batch = odoo.search_read("product.template", [["id", "in", part]], fields,
+                                 limit=100000, offset=0, order="id asc",
+                                 context={"active_test": False}) or []
+        rows = [{"odoo_id": int(r["id"]), **creacion_cols(r, fields, TB_PRODUCT_TEMPLATES)}
+                for r in batch]
+        rows = [r for r in rows if r.get("create_date")]
+        if rows:
+            sb_upsert_basic(TB_PRODUCT_TEMPLATES, rows, on_conflict="odoo_id", batch_size=1000)
+            total += len(rows)
+
+    print(f"✅ product_templates creación backfill: {total}/{len(ids)} templates")
+    return total
 
 
 # =========================
@@ -5692,6 +5786,7 @@ def sync_mrp_ecos_incremental(odoo: OdooClient, chunk: int = 500,
         "user_id", "effectivity", "effectivity_date",
         "approved", "allow_apply_change", "priority", "note",
         "active", "company_id", "create_date", "write_date",
+        "create_uid",   # ✅ KPI Modulación: quién creó la ECO
     ]
     try:
         fields = available_fields(odoo, model, desired)
@@ -5750,6 +5845,10 @@ def sync_mrp_ecos_incremental(odoo: OdooClient, chunk: int = 500,
                 "write_date": parse_odoo_dt(r.get("write_date")),
                 "raw": r,
             }
+            if "create_uid" in fields and sb_has_column(TB_ECO, "create_uid"):
+                cu_id, cu_name = m2o(r.get("create_uid"))
+                row["create_uid"] = cu_id
+                row["create_uid_name"] = cu_name
             if full and run_ts_iso:
                 row["last_seen_at"] = run_ts_iso
                 row["is_active"] = True
@@ -5760,6 +5859,167 @@ def sync_mrp_ecos_incremental(odoo: OdooClient, chunk: int = 500,
         total += len(rows)
 
     print(f"✅ mrp_ecos {'FULL' if full else 'incremental'}: {total} filas (desde write_date>{last if not full else 'ALL'})")
+    return total
+
+
+def backfill_mrp_ecos_create_uid(odoo: OdooClient) -> int:
+    """Una pasada FULL de mrp.eco si quedan ECO sin create_uid (son ~550 filas,
+    es barato). En régimen queda en no-op."""
+    if not sb_has_column(TB_ECO, "create_uid"):
+        return 0
+    res = sb.table(TB_ECO).select("odoo_id").is_("create_uid", "null").limit(1).execute()
+    if not (getattr(res, "data", None) or []):
+        return 0
+    print("🔁 mrp_ecos: hay ECO sin create_uid → pasada FULL")
+    return sync_mrp_ecos_incremental(odoo, chunk=500, full=True)
+
+
+# =========================
+# mrp.eco.approval -> mrp_eco_approvals (KPI Modulación)
+# =========================
+def sync_mrp_eco_approvals_incremental(odoo: OdooClient, chunk: int = 500, full: bool = False) -> int:
+    """Aprobaciones del PLM: quién aprobó / rechazó / comentó cada ECO y cuándo."""
+    model = "mrp.eco.approval"
+    table = TB_ECO_APPROVALS
+    if not sb_has_column(table, "odoo_id"):
+        return 0
+
+    desired = [
+        "id", "eco_id", "name", "approval_template_id", "approval_type",
+        "user_id", "status", "approval_date", "eco_stage_id", "template_stage_id",
+        "is_closed", "create_date", "write_date",
+    ]
+    try:
+        fields = available_fields(odoo, model, desired)
+    except Exception as e:
+        print(f"⚠️ mrp.eco.approval no disponible: {e}")
+        return 0
+    if "id" not in fields:
+        return 0
+
+    domain: list = []
+    last = None if full else sb_get_max_write_date(table)
+    if last:
+        domain.append(["write_date", ">", last])
+
+    total = 0
+    for batch in iter_search_read_all(odoo, model, domain, fields, chunk=chunk, context={"active_test": False}):
+        rows: List[dict] = []
+        for r in batch:
+            eco_id, eco_name = m2o(r.get("eco_id"))
+            tpl_id, tpl_name = m2o(r.get("approval_template_id"))
+            user_id, user_name = m2o(r.get("user_id"))
+            es_id, es_name = m2o(r.get("eco_stage_id"))
+            ts_id, ts_name = m2o(r.get("template_stage_id"))
+            rows.append({
+                "odoo_id": int(r["id"]),
+                "eco_id": eco_id,
+                "eco_name": eco_name,
+                "name": r.get("name") or None,
+                "approval_template_id": tpl_id,
+                "approval_template_name": tpl_name,
+                "approval_type": r.get("approval_type") or None,
+                "user_id": user_id,
+                "user_name": user_name,
+                "status": r.get("status") or None,
+                "approval_date": parse_odoo_dt(r.get("approval_date")),
+                "eco_stage_id": es_id,
+                "eco_stage_name": es_name,
+                "template_stage_id": ts_id,
+                "template_stage_name": ts_name,
+                "is_closed": r.get("is_closed"),
+                "create_date": parse_odoo_dt(r.get("create_date")),
+                "write_date": parse_odoo_dt(r.get("write_date")),
+                "raw": r,
+            })
+        sb_upsert_basic(table, rows, on_conflict="odoo_id", batch_size=1000)
+        total += len(rows)
+
+    print(f"✅ mrp_eco_approvals {'FULL' if full else 'incremental'}: {total} filas")
+    return total
+
+
+# =========================
+# Historial de etapas de ECO (mail.tracking.value) -> mrp_eco_stage_hist
+# =========================
+def sync_mrp_eco_stage_tracking(odoo: OdooClient, chunk: int = 1000) -> int:
+    """Baja los cambios de etapa (stage_id) de mrp.eco desde el chatter.
+
+    Incremental por id de mail.tracking.value (> el mayor ya bajado). La primera
+    corrida trae toda la historia. Odoo restringe mail.tracking.value a
+    administradores: si el usuario del sync no tiene acceso, se avisa y se sigue;
+    el trigger trg_mrp_eco_stage_log de Supabase registra los cambios igual
+    (source='espejo', resolución del ciclo de 20 min, sin autor).
+    """
+    table = TB_ECO_STAGE_HIST
+    if not sb_has_column(table, "odoo_tracking_id"):
+        return 0
+
+    model = "mail.tracking.value"
+    try:
+        meta = odoo.fields_get(model)
+    except Exception as e:
+        print(f"⚠️ {model} sin acceso para el usuario del sync (queda solo el trigger del espejo): {e}")
+        return 0
+    # Odoo 17+ usa field_id; 16 usaba field (m2o a ir.model.fields)
+    fcol = "field_id" if "field_id" in meta else ("field" if "field" in meta else None)
+    if not fcol:
+        print(f"⚠️ {model}: no encuentro la columna del campo trackeado; se omite")
+        return 0
+
+    res = (sb.table(table).select("odoo_tracking_id").not_.is_("odoo_tracking_id", "null")
+           .order("odoo_tracking_id", desc=True).limit(1).execute())
+    data = getattr(res, "data", None) or []
+    last_id = int(data[0]["odoo_tracking_id"]) if data else 0
+
+    domain = [
+        [f"{fcol}.model", "=", "mrp.eco"],
+        [f"{fcol}.name", "=", "stage_id"],
+        ["id", ">", last_id],
+    ]
+    fields = [f for f in ["id", "mail_message_id", "old_value_integer", "new_value_integer",
+                          "old_value_char", "new_value_char", "create_date"] if f in meta]
+
+    total = 0
+    try:
+        for batch in iter_search_read_all(odoo, model, domain, fields, chunk=chunk):
+            msg_ids = uniq_ints([m2o(r.get("mail_message_id"))[0] for r in batch])
+            msgs: Dict[int, dict] = {}
+            for part in chunked(msg_ids, 500):
+                for m in odoo.search_read("mail.message", [["id", "in", part]],
+                                          ["id", "model", "res_id", "date", "create_uid", "author_id"],
+                                          limit=100000, offset=0, order="id asc") or []:
+                    msgs[int(m["id"])] = m
+
+            rows: List[dict] = []
+            for r in batch:
+                mid, _ = m2o(r.get("mail_message_id"))
+                m = msgs.get(mid or -1)
+                if not m or m.get("model") != "mrp.eco" or not m.get("res_id"):
+                    continue
+                uid, uname = m2o(m.get("create_uid"))
+                if not uname:
+                    _, uname = m2o(m.get("author_id"))
+                rows.append({
+                    "odoo_tracking_id": int(r["id"]),
+                    "eco_id": int(m["res_id"]),
+                    "old_stage_id": r.get("old_value_integer") or None,
+                    "old_stage_name": r.get("old_value_char") or None,
+                    "new_stage_id": r.get("new_value_integer") or None,
+                    "new_stage_name": r.get("new_value_char") or None,
+                    "changed_at": parse_odoo_dt(m.get("date") or r.get("create_date")),
+                    "changed_by_id": uid,
+                    "changed_by_name": uname,
+                    "source": "odoo_tracking",
+                })
+            rows = [x for x in rows if x["changed_at"]]
+            if rows:
+                sb_upsert_basic(table, rows, on_conflict="odoo_tracking_id", batch_size=1000)
+                total += len(rows)
+    except Exception as e:
+        print(f"⚠️ tracking de etapas ECO: {e} (queda solo el trigger del espejo)")
+
+    print(f"✅ mrp_eco_stage_hist (tracking Odoo): {total} cambios nuevos desde id>{last_id}")
     return total
 
 
@@ -6176,6 +6436,12 @@ def main():
     except Exception as e:
         print(f"⚠️ product_products: {e}")
 
+    # Creación de productos (KPI Modulación): no-op cuando ya está todo lleno.
+    try:
+        backfill_product_templates_creacion(odoo, chunk_ids=1000)
+    except Exception as e:
+        print(f"⚠️ product_templates creación backfill: {e}")
+
     # EETT: red de seguridad para las fichas que ya estaban cargadas antes de que
     # existieran las columnas (el incremental por write_date no las ve). Va en el
     # full diario, no cada 20 min.
@@ -6268,6 +6534,20 @@ def main():
         sync_mrp_ecos_incremental(odoo, chunk=500)
     except Exception as e:
         print(f"⚠️ mrp_ecos incremental: {e}")
+
+    # KPI Modulación: create_uid de ECO, aprobaciones PLM e historial de etapas.
+    try:
+        backfill_mrp_ecos_create_uid(odoo)
+    except Exception as e:
+        print(f"⚠️ mrp_ecos create_uid backfill: {e}")
+    try:
+        sync_mrp_eco_approvals_incremental(odoo, chunk=500, full=FORCE_FULL_RESYNC)
+    except Exception as e:
+        print(f"⚠️ mrp_eco_approvals: {e}")
+    try:
+        sync_mrp_eco_stage_tracking(odoo, chunk=1000)
+    except Exception as e:
+        print(f"⚠️ mrp_eco_stage_hist: {e}")
 
     # Batches de pickings (liviano; va antes para que batch_id ya tenga su fila)
     try:
