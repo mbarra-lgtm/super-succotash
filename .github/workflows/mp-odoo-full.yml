@@ -2,7 +2,14 @@ name: Odoo → Supabase FULL resync (1x/día L-V)
 
 on:
   # Disparado por pg_cron en Supabase (job 'dispatch-mp-odoo-full') vía workflow_dispatch.
+  # Para la primera limpieza de líneas fantasma de account_move_lines, correr a mano
+  # desde Actions con aml_ghost_days = 0 (recorre todo el espejo, ~143 k asientos).
   workflow_dispatch:
+    inputs:
+      aml_ghost_days:
+        description: "Días hacia atrás del backfill de líneas fantasma (0 = todo el espejo)"
+        required: false
+        default: "120"
 
 concurrency:
   group: odoo-sync            # mismo grupo que el job de 20 min → nunca corren a la vez
@@ -18,6 +25,7 @@ jobs:
     env:
       RUN_ONCE:                  "1"
       FORCE_FULL_RESYNC:         "1"   # corre stock/purchase/account_moves FULL + archivado, 1 vez
+      AML_GHOST_DAYS:            ${{ inputs.aml_ghost_days || '120' }}   # backfill fantasmas account_move_lines
       TZ_LOCAL:                  "America/Santiago"
       WORK_START_HOUR:           "7"
       WORK_END_HOUR:             "19"
