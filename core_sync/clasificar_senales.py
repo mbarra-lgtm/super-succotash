@@ -40,7 +40,7 @@ log = logging.getLogger("clasificar_senales")
 API            = "https://api.anthropic.com/v1/messages"
 MODELO         = os.getenv("RADAR_MODELO", "claude-sonnet-4-5")
 
-MAX_PASAJES     = int(os.getenv("RADAR_MAX_PASAJES", "25"))
+MAX_PASAJES     = int(os.getenv("RADAR_MAX_PASAJES", "40"))
 VENTANA_FUSION  = int(os.getenv("RADAR_VENTANA_FUSION", "900"))
 LIMITE_DOCS     = int(os.getenv("RADAR_LIMITE_DOCS", "50"))
 
@@ -79,12 +79,27 @@ def fusionar_pasajes(filas: list) -> list:
         else:
             grupos.append([f])
 
+    # Si hay más grupos que MAX_PASAJES, se quedan los de mayor peso, no los
+    # primeros del documento. Antes era pasajes[:MAX_PASAJES] por posición: el
+    # acta CORE Biobío N°9 (14-05-2026) ya daba 31 pasajes y se cortaban los 6
+    # últimos — justo donde vienen los acuerdos de ambulancias repetidos en el
+    # anexo. Con cada keyword nueva (clínicas móviles) el corte empeoraba.
+    if len(grupos) > MAX_PASAJES:
+        def relevancia(g):
+            pesos = [x.get("peso") or 1 for x in g]
+            return (max(pesos), sum(pesos))
+        elegidos = sorted(range(len(grupos)), key=lambda i: relevancia(grupos[i]),
+                          reverse=True)[:MAX_PASAJES]
+        log.info("   %d pasajes > MAX_PASAJES=%d: se quedan los de mayor peso",
+                 len(grupos), MAX_PASAJES)
+        grupos = [grupos[i] for i in sorted(elegidos)]
+
     pasajes = []
     for g in grupos:
         texto    = max((x["pasaje"] for x in g), key=len)
         terminos = sorted({x["termino"] for x in g})
         pasajes.append(f"[keywords: {', '.join(terminos)}]\n{texto}")
-    return pasajes[:MAX_PASAJES]
+    return pasajes
 
 
 # ── Modelo ──────────────────────────────────────────────────────────────────
