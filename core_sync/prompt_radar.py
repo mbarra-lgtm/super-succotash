@@ -12,11 +12,11 @@ Al cambiar el criterio, sube PROMPT_VERSION: queda registrado en
 core_senales.prompt_version y permite comparar tandas al recalibrar.
 """
 
-PROMPT_VERSION = "radar-v3"
+PROMPT_VERSION = "radar-v4"
 
 SYSTEM = """Eres analista de inteligencia comercial de Bertonati Vehiculos Especiales,
-fabricante chileno de ambulancias, carros bomba, vehiculos blindados y carrozados
-especiales.
+fabricante chileno de ambulancias, carros bomba, vehiculos blindados, clinicas
+moviles (veterinarias, dentales, oftalmologicas, medicas) y carrozados especiales.
 
 Tu trabajo es leer material publico chileno —actas y acuerdos de Consejos
 Regionales (CORE), actas de concejos municipales, y notas de prensa— y decidir
@@ -26,6 +26,15 @@ QUE ES UNA SEÑAL (registrala):
 - Aprobacion de financiamiento (FNDR, circular 33, subvencion municipal, convenio)
   para ADQUIRIR ambulancias, carros bomba, material mayor de bomberos, vehiculos
   blindados o moviles de emergencia.
+- Aprobacion de financiamiento para ADQUIRIR o REPONER una CLINICA MOVIL:
+  clinica veterinaria movil, clinica dental movil, clinica oftalmologica movil,
+  unidad medica movil, mamografo movil. Son camiones o furgones carrozados con
+  box de atencion: es exactamente lo que Bertonati fabrica. Categoria
+  'clinica_movil'. Casos reales que el radar dejo pasar (acta CORE Biobio
+  14-05-2026): "Adquisicion Clinica Veterinaria movil para la comuna de Antuco",
+  "Reposicion Clinica Veterinaria movil, comuna de Cabrero", "Adquisicion
+  Clinica Dental Movil, Santa Barbara". A veces el texto omite "clinica"
+  ("Adquisicion Veterinaria Movil comuna de Mulchen"): es la misma señal.
 - Licitacion, adjudicacion o entrega de esos mismos vehiculos.
 - Acuerdos que comprometen presupuesto futuro para renovacion de flota de
   emergencia, aunque no den la cifra exacta.
@@ -47,7 +56,13 @@ QUE NO ES UNA SEÑAL (no la registres, por mucho que aparezca la palabra):
   vehiculos, no inmuebles. Ante cualquier duda entre edificio y vehiculo,
   descartala.
 - Construccion o reparacion de postas, hospitales, CESFAM y SAR (el edificio;
-  la ambulancia PARA un SAR si es señal).
+  la ambulancia PARA un SAR si es señal). Lo mismo con las clinicas: una
+  clinica veterinaria municipal FIJA o un centro de esterilizacion es un
+  inmueble; solo cuenta si es MOVIL (vehiculo, camion, carroceria, box rodante).
+- Clinicas moviles EN USO: operativos de esterilizacion o vacunacion, rondas
+  medicas, "la clinica movil visitara el sector X", menciones de clinicas
+  moviles instaladas durante una emergencia. Describen un vehiculo que ya
+  existe, no una compra.
 - Lineas de presupuesto genericas: glosas tipo "29 ADQUISICION DE ACTIVOS NO
   FINANCIEROS / 03 Vehiculos", "dotacion maxima de vehiculos", programas de
   funcionamiento del propio Gobierno Regional.
@@ -98,7 +113,7 @@ def herramienta(con_indice: bool = False) -> dict:
     props = {
         "categoria": {"type": "string", "enum": [
             "ambulancia", "carro_bomba", "blindado",
-            "movil_policial", "rescate", "carroceria", "otro"]},
+            "movil_policial", "rescate", "carroceria", "clinica_movil", "otro"]},
         "etapa": {"type": "string", "enum": [
             "idea", "financiamiento_aprobado", "licitacion_publicada",
             "adjudicada", "entregada", "rechazada"]},
