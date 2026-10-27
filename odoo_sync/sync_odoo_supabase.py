@@ -98,6 +98,40 @@ HOT_STEPS_ENV = [s.strip() for s in os.getenv("HOT_STEPS", HOT_STEPS_DEFAULT).sp
 RECONCILE_MIN_MINUTES = int(os.getenv("RECONCILE_MIN_MINUTES", "55"))
 RECONCILE_DATASET = "reconcile_bajas"
 
+# ── Apuntes contables (account.move.line): dos agujeros del incremental ──────
+# 1) LÍNEAS FANTASMA. Al pasar una factura a borrador y volver a publicarla, Odoo
+#    BORRA sus líneas y crea otras con id nuevo. El incremental trae las nuevas
+#    (write_date reciente) pero las borradas no tienen write_date que aparezca:
+#    quedan is_active en el espejo y la factura muestra dos CxP con montos
+#    distintos (caso FAC 32714103 COPEC, 2026-10-26; ~570 facturas afectadas).
+#    → AML_MOVE_RECONCILE: después del incremental, para cada asiento que trajo
+#      líneas se piden a Odoo los ids vivos del asiento y se da de baja (soft) lo
+#      que sobra en el espejo. Barato: solo los asientos tocados en la corrida.
+# 2) SALDO DESFASADO. amount_residual / reconciled son campos computados
+#    almacenados: cuando se concilia un pago Odoo los recalcula SIN tocar el
+#    write_date de la línea, así que el incremental nunca los vuelve a ver y la
+#    factura pagada sigue "abierta" en el espejo (458 cuotas / $563 MM al 26-10).
+#    → AML_OPEN_SWEEP: barrido de la cartera abierta (CxP + CxC no conciliadas,
+#      ~2,5 k líneas) en cada corrida: re-trae de Odoo todo lo abierto con su
+#      saldo actual, y lo que el espejo cree abierto pero Odoo ya no lo
+#      re-consulta por id: si existe se actualiza (queda conciliado), si no
+#      existe se da de baja.
+AML_MOVE_RECONCILE = os.getenv("AML_MOVE_RECONCILE", "1").strip() == "1"
+AML_OPEN_SWEEP     = os.getenv("AML_OPEN_SWEEP", "1").strip() == "1"
+# Limpieza de fantasmas viejos (anteriores a este parche): recorre asiento por
+# asiento los últimos AML_GHOST_DAYS días. Corre en el job diario
+# (FORCE_FULL_RESYNC=1) o a mano con AML_GHOST_BACKFILL=1. AML_GHOST_DAYS=0 =
+# todo el espejo (primera limpieza).
+AML_GHOST_BACKFILL = os.getenv("AML_GHOST_BACKFILL", "0").strip() == "1"
+AML_GHOST_DAYS     = int(os.getenv("AML_GHOST_DAYS", "120"))
+# Freno de seguridad del barrido: si lo que habría que dar de baja supera esta
+# fracción de la cartera abierta del espejo, no se marca nada (fetch parcial).
+AML_SWEEP_MAX_FRAC = float(os.getenv("AML_SWEEP_MAX_FRAC", "0.25"))
+# Compañías que se barren. Tiene que coincidir en Odoo y en el espejo: una línea
+# de otra compañía que el usuario API no ve se re-consultaría por id, no
+# volvería y se daría de baja en falso. Default: solo BVE (company_id=1).
+AML_SWEEP_COMPANY_IDS = [int(x) for x in os.getenv("AML_SWEEP_COMPANY_IDS", "1").split(",") if x.strip()]
+
 # EETT (ficha técnica en product.template, campos x_studio_* creados sep-2026).
 # El backfill completo recorre los templates con ficha cargada; va en el ciclo
 # diario, no en el de 20 min. FORCE_ETT_BACKFILL=1 lo dispara a mano (primera
@@ -5050,7 +5084,22 @@ def sync_account_moves_incremental(odoo: OdooClient, chunk: int = 800) -> int:
 # NEW: Accounting - Account Move Lines (heavy) via your RPC
 # You said you created rpc_upsert_account_move_lines already.
 # =========================
-def sync_account_move_lines_incremental(odoo: OdooClient, run_ts_iso: str, chunk: int = 1500) -> int:
+def sync_account_move_lines_incremental(
+    odoo: OdooClient,
+    run_ts_iso: str,
+    chunk: int = 1500,
+    domain_override: Optional[list] = None,
+    collect_ids: Optional[set] = None,
+    collect_move_ids: Optional[set] = None,
+    label: str = "incremental",
+) -> int:
+    """Incremental de account.move.line por write_date.
+
+    domain_override: si viene, reemplaza el filtro por write_date (lo usan el
+      barrido de cartera abierta y la re-consulta por id).
+    collect_ids / collect_move_ids: sets que se llenan con los ids de línea y de
+      asiento traídos, para la reconciliación por asiento.
+    """
     model = "account.move.line"
     table = TB_ACCOUNT_MOVE_LINES
  
@@ -5090,10 +5139,14 @@ def sync_account_move_lines_incremental(odoo: OdooClient, run_ts_iso: str, chunk
     ]
     fields = available_fields(odoo, model, desired)
  
-    last = sb_get_max_write_date(table)
-    domain: list = []
-    if last:
-        domain.append(["write_date", ">", last])
+    if domain_override is not None:
+        last = None
+        domain: list = list(domain_override)
+    else:
+        last = sb_get_max_write_date(table)
+        domain = []
+        if last:
+            domain.append(["write_date", ">", last])
  
     acct_map: Dict[int, Tuple[Optional[str], Optional[str]]] = {}
     try:
@@ -5145,6 +5198,10 @@ def sync_account_move_lines_incremental(odoo: OdooClient, run_ts_iso: str, chunk
             aml_id = int(r["id"])
  
             move_id, _move_name = m2o(r.get("move_id"))
+            if collect_ids is not None:
+                collect_ids.add(aml_id)
+            if collect_move_ids is not None and move_id:
+                collect_move_ids.add(int(move_id))
             account_id, _acc_name = m2o(r.get("account_id"))
             partner_id, _partner_name = m2o(r.get("partner_id"))
             company_id, company_name = m2o(r.get("company_id"))
@@ -5277,7 +5334,10 @@ def sync_account_move_lines_incremental(odoo: OdooClient, run_ts_iso: str, chunk
         total_rows += len(rows)
         affected += sb_rpc_upsert("rpc_upsert_account_move_lines", rows, batch_size=BATCH_AML)
  
-    print(f"✅ account_move_lines incremental: fetched={total_rows} | db_affected={affected} (desde write_date>{last})")
+    if domain_override is not None:
+        print(f"✅ account_move_lines {label}: fetched={total_rows} | db_affected={affected}")
+    else:
+        print(f"✅ account_move_lines {label}: fetched={total_rows} | db_affected={affected} (desde write_date>{last})")
     return total_rows
 
 # =========================
@@ -5874,6 +5934,159 @@ def reconcile_all_deletions(odoo: OdooClient, run_ts_iso: str) -> dict:
 
 
 # =========================
+# Apuntes contables: fantasmas y cartera abierta
+# =========================
+def _sb_rpc_value(fn: str, params: dict):
+    """Llama una RPC que devuelve un escalar o un arreglo y lo devuelve tal cual."""
+    res = sb.rpc(fn, params).execute()
+    err = getattr(res, "error", None)
+    if err:
+        raise RuntimeError(f"Supabase RPC error {fn}: {err}")
+    data = getattr(res, "data", None)
+    # PostgREST a veces envuelve el escalar en una lista de un elemento
+    if isinstance(data, list) and len(data) == 1 and not isinstance(data[0], (int, float)) and isinstance(data[0], (list, dict)):
+        data = data[0]
+    return data
+
+
+def reconcile_aml_by_moves(odoo: OdooClient, move_ids: Iterable[int], run_ts_iso: str, chunk: int = 200) -> int:
+    """Da de baja (soft) las líneas del espejo que ya no existen en Odoo, asiento
+    por asiento.
+
+    Para cada bloque de asientos pide a Odoo SOLO los ids de sus líneas vivas y
+    llama a rpc_aml_mark_missing_by_move, que marca is_active=false lo que el
+    espejo tiene de más en esos asientos. Los asientos para los que Odoo no
+    devuelve ninguna línea se SALTAN (puede ser un asiento borrado entero: eso lo
+    resuelve el archivado diario de account_moves, no esto), así un error que
+    devuelva vacío nunca da de baja un asiento completo.
+    """
+    ids = sorted({int(m) for m in move_ids if m})
+    if not ids:
+        return 0
+    total = 0
+    for part in chunked(ids, chunk):
+        live: List[int] = []
+        moves_con_lineas: set = set()
+        for batch in iter_search_read_all(odoo, "account.move.line", [["move_id", "in", part]],
+                                          ["id", "move_id"], chunk=5000):
+            for r in batch:
+                live.append(int(r["id"]))
+                mid, _ = m2o(r.get("move_id"))
+                if mid:
+                    moves_con_lineas.add(int(mid))
+        if not moves_con_lineas:
+            continue
+        n = _sb_rpc_value("rpc_aml_mark_missing_by_move", {
+            "p_move_ids": sorted(moves_con_lineas),
+            "p_live_ids": live,
+            "p_run_ts": run_ts_iso,
+        })
+        total += int(n or 0)
+    print(f"🪦 account_move_lines por asiento: {total} líneas fantasma dadas de baja | asientos revisados={len(ids)}")
+    return total
+
+
+def sweep_open_items_aml(odoo: OdooClient, run_ts_iso: str) -> dict:
+    """Barrido de la cartera abierta (CxP + CxC no conciliadas).
+
+    1. Trae de Odoo TODAS las líneas de cuentas por pagar / por cobrar publicadas
+       y no conciliadas, con todos sus campos, y las upsertea (refresca
+       amount_residual, que Odoo recalcula sin tocar write_date).
+    2. Pide al espejo los ids que él cree abiertos. Lo que el espejo tiene abierto
+       y Odoo no, se re-consulta por id: si existe, el upsert lo deja conciliado;
+       si no existe, se da de baja.
+    """
+    dom = [
+        ["account_id.account_type", "in", ["liability_payable", "asset_receivable"]],
+        ["reconciled", "=", False],
+        ["parent_state", "=", "posted"],
+        ["company_id", "in", AML_SWEEP_COMPANY_IDS],
+    ]
+    odoo_open: set = set()
+    sync_account_move_lines_incremental(odoo, run_ts_iso, chunk=1500, domain_override=dom,
+                                        collect_ids=odoo_open, label="cartera abierta")
+    if not odoo_open:
+        print("⚠️ barrido cartera: Odoo devolvió 0 líneas abiertas, se aborta por seguridad")
+        return {"abiertas_odoo": 0}
+
+    espejo = _sb_rpc_value("rpc_aml_open_items_ids", {"p_company_ids": AML_SWEEP_COMPANY_IDS}) or []
+    espejo_open = {int(x) for x in espejo}
+    stale = sorted(espejo_open - odoo_open)
+
+    refrescadas: set = set()
+    for part in chunked(stale, 500):
+        sync_account_move_lines_incremental(odoo, run_ts_iso, chunk=1500,
+                                            domain_override=[["id", "in", part]],
+                                            collect_ids=refrescadas, label="cierre de cartera")
+    borradas = [i for i in stale if i not in refrescadas]
+
+    marcadas = 0
+    tope = max(50, int(len(espejo_open) * AML_SWEEP_MAX_FRAC))
+    if len(borradas) > tope:
+        print(f"⚠️ barrido cartera: {len(borradas)} líneas a dar de baja > tope {tope}; "
+              f"no se marca nada (posible fetch parcial)")
+    elif borradas:
+        for part in chunked(borradas, 2000):
+            marcadas += int(_sb_rpc_value("rpc_aml_mark_missing_ids",
+                                          {"p_ids": part, "p_run_ts": run_ts_iso}) or 0)
+
+    out = {
+        "abiertas_odoo": len(odoo_open),
+        "abiertas_espejo": len(espejo_open),
+        "cerradas_refrescadas": len(refrescadas),
+        "borradas_marcadas": marcadas,
+    }
+    print(f"🧾 Barrido cartera abierta: {out}")
+    try:
+        sb.rpc("stamp_freshness", {
+            "p_dataset": "aml_cartera_abierta",
+            "p_rows_changed": len(refrescadas) + marcadas,
+            "p_duration_ms": None,
+            "p_source": "sync_odoo_supabase",
+        }).execute()
+    except Exception as e:
+        print(f"⚠️ barrido cartera: no se pudo estampar data_freshness ({e})")
+    return out
+
+
+def backfill_aml_ghosts(odoo: OdooClient, run_ts_iso: str, days: int = AML_GHOST_DAYS) -> int:
+    """Limpieza de fantasmas anteriores al parche: reconcilia por asiento todos
+    los asientos del espejo con fecha en los últimos `days` días (0 = todos)."""
+    desde = None if days <= 0 else (datetime.now(TZ_LOCAL).date() - timedelta(days=days)).isoformat()
+    move_ids = _sb_rpc_value("rpc_aml_move_ids", {"p_desde": desde, "p_company_ids": AML_SWEEP_COMPANY_IDS}) or []
+    print(f"🧹 Backfill fantasmas account_move_lines | asientos={len(move_ids)} | desde={desde or 'siempre'}")
+    return reconcile_aml_by_moves(odoo, [int(x) for x in move_ids], run_ts_iso)
+
+
+def sync_account_move_lines_with_reconcile(odoo: OdooClient, run_ts_iso: str) -> None:
+    """Incremental de apuntes + reconciliación por asiento + barrido de cartera.
+    Cada etapa en su try: si una falla, las otras corren igual."""
+    tocados: set = set()
+    try:
+        sync_account_move_lines_incremental(odoo, run_ts_iso, chunk=1500, collect_move_ids=tocados)
+    except Exception as e:
+        print(f"⚠️ account_move_lines incremental: {e}")
+
+    if AML_MOVE_RECONCILE and tocados:
+        try:
+            reconcile_aml_by_moves(odoo, tocados, run_ts_iso)
+        except Exception as e:
+            print(f"⚠️ account_move_lines reconciliación por asiento: {e}")
+
+    if AML_OPEN_SWEEP:
+        try:
+            sweep_open_items_aml(odoo, run_ts_iso)
+        except Exception as e:
+            print(f"⚠️ barrido cartera abierta: {e}")
+
+    if AML_GHOST_BACKFILL or FORCE_FULL_RESYNC:
+        try:
+            backfill_aml_ghosts(odoo, run_ts_iso, AML_GHOST_DAYS)
+        except Exception as e:
+            print(f"⚠️ backfill fantasmas account_move_lines: {e}")
+
+
+# =========================
 # Ciclo "hot" (cadencia corta)
 # =========================
 # Cada entrada es (nombre, función). Se define acá abajo y no arriba con las
@@ -5895,6 +6108,10 @@ HOT_STEP_FNS: Dict[str, Callable[[OdooClient, str], object]] = {
     "move_lines":           lambda odoo, ts: sync_move_lines_incremental(odoo, ts, chunk=1500),
     "stock_quants":         lambda odoo, ts: sync_stock_quants_incremental(odoo, ts, chunk=1000),
     "analytic_lines":       lambda odoo, ts: sync_account_analytic_lines_incremental(odoo, ts, chunk=1500),
+    # Cartera CxP / CxC al minuto (dossier de proveedores, crédito, tesorería):
+    # cabeceras + apuntes con reconciliación por asiento y barrido de abiertas.
+    "cartera":              lambda odoo, ts: (sync_account_moves_incremental(odoo, chunk=800),
+                                              sync_account_move_lines_with_reconcile(odoo, ts)),
 }
 
 
@@ -6208,10 +6425,10 @@ def main():
     except Exception as e:
         print(f"⚠️ account_moves incremental: {e}")
 
-    try:
-        sync_account_move_lines_incremental(odoo, run_ts_iso, chunk=1500)
-    except Exception as e:
-        print(f"⚠️ account_move_lines incremental: {e}")
+    # Incremental + reconciliación por asiento (líneas fantasma) + barrido de
+    # cartera abierta (saldos que Odoo recalcula sin tocar write_date). Ver
+    # AML_MOVE_RECONCILE / AML_OPEN_SWEEP arriba.
+    sync_account_move_lines_with_reconcile(odoo, run_ts_iso)
 
     # ============================================================
     # FULL resync de account_moves (1x al día)
