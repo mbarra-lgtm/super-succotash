@@ -86,7 +86,7 @@ ORDEN_ETAPAS = ["financiamiento_aprobado", "licitacion_publicada", "idea",
 CATEGORIAS = {
     "ambulancia": "Ambulancia", "carro_bomba": "Carro bomba", "blindado": "Blindado",
     "movil_policial": "Móvil policial", "rescate": "Rescate",
-    "carroceria": "Carrocería", "otro": "Otro",
+    "carroceria": "Carrocería", "clinica_movil": "Clínica móvil", "otro": "Otro",
 }
 
 
