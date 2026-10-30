@@ -10,18 +10,33 @@ Archivos mensuales (blob Azure público, ~90 MB zip, CSV ';' una fila por ítem)
   cargar sin esperar al cierre de mes.
   El CSV viene en CP1252, no en UTF-8: leerlo como utf-8 corrompe todos los acentos.
 
-Estrategia acordada:
-  - HEADERS: se cargan TODAS las OCs del mes (match OC↔licitación de todo el mercado).
-  - ITEMS: solo de OCs de RUTs objetivo (grupo+competidores) o con CodigoLicitacion.
+Estrategia (desde 30-10-2026):
+  - LAKE: el mes COMPLETO (todas las OC del mercado, todas las líneas, todas las columnas
+    del CSV tal cual vienen) se guarda en Parquet en el bucket privado 'lake' de Supabase:
+        da/oc/mes=AAAA-MM/data_N.parquet
+    Cada corrida reemplaza los archivos de ese mes. Se consulta con DuckDB
+    (_tools/lake_connect.py del bucket, vista mp.da_oc).
+  - SUPABASE: solo las OC RELEVANTES, que son las que leen los paneles:
+      · proveedor del grupo o competidor (mp_competidores)
+      · proveedor objetivo (mp_oc_targets)
+      · proveedor cuyo nombre calza con los competidores del panel de mercado
+      · OC con alguna línea de vehículos (categorías 2510, 2511, 2517, 2519)
+    Antes se subían las ~150.000 OC del mes completo todos los días (140 mil
+    reescrituras diarias que después borraba el recorte nocturno lake_trim_oc).
+  - ITEMS en Supabase: de las OC relevantes, con el mismo criterio por OC que antes
+    (RUT objetivo o con CodigoLicitacion) más las OC de vehículos.
   - raw_hash se marca 'da:{mes}' para que los backfills por API las salten.
 
 Config por env:
-  OC_DA_MESES    p.ej. "2025-12,2026-1,2026-2"  (default: dic-2025 → may-2026)
-  OC_DA_LOCALZIP ruta a un zip ya descargado (para pruebas; ignora OC_DA_MESES)
-  OC_DA_LIMIT    tope de filas a procesar (smoke test)
+  OC_DA_MESES         p.ej. "2025-12,2026-1,2026-2"  (default: dic-2025 → may-2026)
+  OC_DA_LOCALZIP      ruta a un zip ya descargado (para pruebas; ignora OC_DA_MESES)
+  OC_DA_LIMIT         tope de filas a procesar (smoke test)
+  LAKE_EXPORT_KEY     llave del Edge Function lake-export (Vault 'lake_export_key').
+                      Si falta, no se sube al lake y se avisa en el log.
+  DA_SOLO_RELEVANTES  "1" (default) = a Supabase solo las relevantes; "0" = todo el mes como antes
 """
 
-import os, csv, io, sys, time, zipfile, tempfile, logging, requests
+import os, csv, io, re, sys, json, time, zipfile, tempfile, logging, requests
 from datetime import datetime, timezone
 
 try:
@@ -36,6 +51,10 @@ log = logging.getLogger("oc_da")
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SB_KEY       = os.environ["SUPABASE_SERVICE_KEY"]
 SB_REST      = f"{SUPABASE_URL}/rest/v1"
+LAKE_FN      = f"{SUPABASE_URL}/functions/v1/lake-export"
+LAKE_ST      = f"{SUPABASE_URL}/storage/v1"
+LAKE_KEY     = os.getenv("LAKE_EXPORT_KEY") or None
+SOLO_RELEVANTES = os.getenv("DA_SOLO_RELEVANTES", "1") == "1"
 T_HDR, T_ITEMS = "mp_oc_header", "mp_oc_items"
 
 BLOB = "https://transparenciachc.blob.core.windows.net/oc-da/{mes}.zip"
@@ -44,9 +63,17 @@ MESES  = [m.strip() for m in (os.getenv("OC_DA_MESES") or MESES_DEFAULT).split("
 LOCALZIP = os.getenv("OC_DA_LOCALZIP") or None
 LIMIT    = int(os.getenv("OC_DA_LIMIT", "0"))  # 0 = sin tope
 
-# RUTs objetivo para la carga de ITEMS: desde mp_competidores, no una lista literal.
+# RUTs objetivo: desde mp_competidores, no una lista literal. Bertonati siempre incluido.
 from competidores import ruts_norm
-RUTS_NORM = ruts_norm()
+RUTS_NORM = ruts_norm() | {"879279003"}
+
+# Mismos nombres que v_mercado_competidores_oc y lake_trim_oc
+RE_COMPETIDORES = re.compile(
+    r"bertonati|motor outsourcing|naffco|\bdikar\b|pena spoerer|peña spoerer|luis jaime|l\.? ?j\.? ?automotriz|"
+    r"conversiones san jose|technology motor|oshkosh|\bkovacs\b|salinas y fabres|\bok car\b|evodelta|"
+    r"\bmototech\b|jhon charry|\bsolmod\b", re.IGNORECASE)
+CATEGORIAS_VEHICULOS = ("2510", "2511", "2517", "2519")
+
 
 def _norm_rut(v):
     return (v or "").replace(".", "").replace("-", "").strip().upper()
@@ -57,7 +84,6 @@ def _num(v):
     try: return float(s.replace(".", "").replace(",", ".")) if ("," in s) else float(s)
     except: return None
 
-import re
 _RE_FECHA = re.compile(r"^\d{4}-\d{2}-\d{2}")
 
 def _dt(v):
@@ -83,6 +109,21 @@ def _sb_upsert(table, on_conflict, rows, retries=3):
         time.sleep(3 * (i + 1))
     raise RuntimeError(f"upsert {table} falló tras {retries} intentos")
 
+def _targets():
+    """Códigos de proveedor activos en mp_oc_targets."""
+    try:
+        r = requests.get(f"{SB_REST}/mp_oc_targets", headers={"apikey": SB_KEY, "Authorization": f"Bearer {SB_KEY}"},
+                         params={"select": "supplier_code", "is_active": "is.true", "limit": "1000"}, timeout=30)
+        r.raise_for_status()
+        return {str(x["supplier_code"]).strip() for x in r.json() if x.get("supplier_code")}
+    except Exception as e:
+        log.error("No pude leer mp_oc_targets (%s); sigo sin ellos", repr(e))
+        return set()
+
+TARGETS = _targets()
+
+
+# ------------------------------------------------------------------ parseo (igual que antes)
 def parse_header(r, mes, now_iso):
     return {
         "codigo_oc":          _s(r.get("Codigo")),
@@ -156,46 +197,126 @@ def parse_item(r, line_no):
         "total_descuentos": _num(r.get("totalDescuentos")),
     }
 
+
+# ------------------------------------------------------------------ lake
+def _mes_iso(mes):
+    a, m = mes.split("-")[:2]
+    return f"{int(a):04d}-{int(m):02d}"
+
+def _lake_post(body, timeout=120):
+    for i in range(4):
+        try:
+            r = requests.post(LAKE_FN, headers={"x-lake-key": LAKE_KEY, "content-type": "application/json"},
+                              data=json.dumps(body), timeout=(20, timeout))
+            if r.ok:
+                return r.json()
+            err = f"{r.status_code} {r.text[:200]}"
+        except Exception as e:
+            err = repr(e)
+        time.sleep(5 * (i + 1))
+    raise RuntimeError(f"lake-export {body.get('action')}: {err}")
+
+def subir_al_lake(mes, csv_utf8, n_filas_csv):
+    """CSV normalizado (utf-8) -> Parquet zstd en da/oc/mes=AAAA-MM/ del bucket 'lake'."""
+    if not LAKE_KEY:
+        log.warning("Sin LAKE_EXPORT_KEY: el mes %s NO se guarda en el lake", mes)
+        return
+    import duckdb
+    out_dir = tempfile.mkdtemp(prefix="oc_da_pq_")
+    con = duckdb.connect()
+    src = f"read_csv('{csv_utf8}', delim=',', quote='\"', escape='\"', header=true, all_varchar=true, strict_mode=false)"
+    n = con.execute(f"select count(*) from {src}").fetchone()[0]
+    if n != n_filas_csv:
+        raise RuntimeError(f"lake {mes}: DuckDB leyó {n} filas y el CSV tiene {n_filas_csv}; no se sube")
+    con.execute(f"copy (select '{_mes_iso(mes)}' as mes_archivo, * from {src}) to '{out_dir}' "
+                f"(format parquet, compression zstd, row_group_size 50000, file_size_bytes '25MB')")
+    archivos = sorted(f for f in os.listdir(out_dir) if f.endswith(".parquet"))
+    prefijo = f"da/oc/mes={_mes_iso(mes)}/"
+    total = 0
+    for f in archivos:
+        u = _lake_post({"action": "upload_url", "path": prefijo + f})
+        with open(os.path.join(out_dir, f), "rb") as fh:
+            r = requests.put(LAKE_ST + u["url"], data=fh, timeout=(20, 600),
+                             headers={"content-type": "application/octet-stream", "x-upsert": "true", "connection": "close"})
+        if r.status_code not in (200, 201):
+            raise RuntimeError(f"lake {prefijo + f}: {r.status_code} {r.text[:200]}")
+        total += os.path.getsize(os.path.join(out_dir, f))
+    # si este mes antes tenía más archivos, se borran los que sobran
+    viejos = [prefijo + x["name"] for x in _lake_post({"action": "list", "prefix": prefijo})
+              if x.get("name", "").endswith(".parquet") and x["name"] not in archivos]
+    if viejos:
+        _lake_post({"action": "remove", "paths": viejos})
+    log.info("🗄️  lake %s: %s filas → %d archivos, %.1f MB", prefijo, f"{n:,}", len(archivos), total / 1e6)
+
+
+# ------------------------------------------------------------------ proceso de un mes
 def procesar_mes(mes: str, zip_path: str):
     now_iso = datetime.now(timezone.utc).isoformat()
     z = zipfile.ZipFile(zip_path)
     name = z.namelist()[0]
-    seen = set()          # OCs cuyo header ya se envió
-    line_no = {}          # codigo_oc -> correlativo de items
-    buf_h, buf_i = [], []
-    n_rows = n_h = n_i = 0
 
+    # Pasada 1: CSV cp1252 -> CSV utf-8 normalizado (para el lake) + qué OC son relevantes
+    tmp_csv = tempfile.NamedTemporaryFile(suffix=".csv", delete=False, mode="w", encoding="utf-8", newline="")
+    relevantes, con_items = set(), set()
+    n_rows = 0
     with z.open(name) as f:
         reader = csv.DictReader(io.TextIOWrapper(f, encoding="cp1252", errors="replace"), delimiter=";")
+        writer = csv.writer(tmp_csv, quoting=csv.QUOTE_ALL)
+        writer.writerow(reader.fieldnames)
         for r in reader:
             n_rows += 1
             if LIMIT and n_rows > LIMIT: break
+            writer.writerow([r.get(k) for k in reader.fieldnames])
             cod = _s(r.get("Codigo"))
             if not cod: continue
+            objetivo = _norm_rut(r.get("RutSucursal")) in RUTS_NORM
+            vehiculo = (r.get("codigoCategoria") or "").strip().startswith(CATEGORIAS_VEHICULOS)
+            if (objetivo or vehiculo or (_s(r.get("CodigoProveedor")) in TARGETS)
+                    or RE_COMPETIDORES.search(r.get("NombreProveedor") or "")):
+                relevantes.add(cod)
+            if objetivo or vehiculo or _s(r.get("CodigoLicitacion")):
+                con_items.add(cod)
+            if n_rows % 200000 == 0:
+                log.info("  %s: %s filas leídas", mes, f"{n_rows:,}")
+    tmp_csv.close()
+    if LIMIT and n_rows > LIMIT:
+        n_rows = LIMIT
+    log.info("  %s: %s filas CSV, %s OC relevantes", mes, f"{n_rows:,}", f"{len(relevantes):,}")
 
-            if cod not in seen:
-                seen.add(cod)
-                buf_h.append(parse_header(r, mes, now_iso))
-                if len(buf_h) >= 1000:
-                    _sb_upsert(T_HDR, "codigo_oc", buf_h); n_h += len(buf_h); buf_h = []
+    try:
+        # Lake: el mes completo
+        subir_al_lake(mes, tmp_csv.name, n_rows)
 
-            # Items: solo RUTs objetivo o con vínculo a licitación
-            if _norm_rut(r.get("RutSucursal")) in RUTS_NORM or _s(r.get("CodigoLicitacion")):
-                ln = line_no.get(cod, 0) + 1
-                line_no[cod] = ln
-                buf_i.append(parse_item(r, ln))
-                if len(buf_i) >= 1000:
-                    # FK: los headers pendientes deben insertarse antes que sus items
-                    if buf_h:
+        # Pasada 2: Supabase (solo relevantes, o todo si DA_SOLO_RELEVANTES=0)
+        seen, line_no = set(), {}
+        buf_h, buf_i = [], []
+        n_h = n_i = 0
+        with open(tmp_csv.name, encoding="utf-8", newline="") as fh:
+            for r in csv.DictReader(fh):
+                cod = _s(r.get("Codigo"))
+                if not cod: continue
+                if SOLO_RELEVANTES and cod not in relevantes: continue
+                if cod not in seen:
+                    seen.add(cod)
+                    buf_h.append(parse_header(r, mes, now_iso))
+                    if len(buf_h) >= 1000:
                         _sb_upsert(T_HDR, "codigo_oc", buf_h); n_h += len(buf_h); buf_h = []
-                    _sb_upsert(T_ITEMS, "codigo_oc,line_no", buf_i); n_i += len(buf_i); buf_i = []
+                if cod in con_items:
+                    ln = line_no.get(cod, 0) + 1
+                    line_no[cod] = ln
+                    buf_i.append(parse_item(r, ln))
+                    if len(buf_i) >= 1000:
+                        # FK: los headers pendientes deben insertarse antes que sus items
+                        if buf_h:
+                            _sb_upsert(T_HDR, "codigo_oc", buf_h); n_h += len(buf_h); buf_h = []
+                        _sb_upsert(T_ITEMS, "codigo_oc,line_no", buf_i); n_i += len(buf_i); buf_i = []
+        if buf_h: _sb_upsert(T_HDR, "codigo_oc", buf_h); n_h += len(buf_h)
+        if buf_i: _sb_upsert(T_ITEMS, "codigo_oc,line_no", buf_i); n_i += len(buf_i)
+        log.info("✅ %s: %s filas CSV → Supabase %s headers, %s items (%s)", mes, f"{n_rows:,}", f"{n_h:,}", f"{n_i:,}",
+                 "solo relevantes" if SOLO_RELEVANTES else "mes completo")
+    finally:
+        os.unlink(tmp_csv.name)
 
-            if n_rows % 100000 == 0:
-                log.info("  %s: %s filas | headers %s | items %s", mes, f"{n_rows:,}", f"{n_h:,}", f"{n_i:,}")
-
-    if buf_h: _sb_upsert(T_HDR, "codigo_oc", buf_h); n_h += len(buf_h)
-    if buf_i: _sb_upsert(T_ITEMS, "codigo_oc,line_no", buf_i); n_i += len(buf_i)
-    log.info("✅ %s: %s filas CSV → %s headers, %s items", mes, f"{n_rows:,}", f"{n_h:,}", f"{n_i:,}")
 
 def main():
     if LOCALZIP:
@@ -204,7 +325,9 @@ def main():
         procesar_mes(mes, LOCALZIP)
         return
 
-    log.info("=== ingesta OC datos abiertos: %s ===", MESES)
+    log.info("=== ingesta OC datos abiertos: %s (lake: %s, Supabase: %s) ===", MESES,
+             "sí" if LAKE_KEY else "NO", "solo relevantes" if SOLO_RELEVANTES else "todo")
+    errores = 0
     for mes in MESES:
         url = BLOB.format(mes=mes)
         log.info("Descargando %s ...", url)
@@ -218,8 +341,13 @@ def main():
             path = tmp.name
         try:
             procesar_mes(mes, path)
+        except Exception as e:
+            errores += 1
+            log.error("❌ %s: %s", mes, repr(e))
         finally:
             os.unlink(path)
+    if errores:
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
