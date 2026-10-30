@@ -5,6 +5,12 @@ name: MP · OC Datos Abiertos (mes en curso, diario)
 # alcanza a traer la ingesta por API (~1.300 OC/dia contra ~150.000/mes reales)
 # y cualquier informe emitido antes del dia 22 subestima el volumen.
 # La carga del mes vencido sigue en mp-oc-datos-abiertos.yml (dia 22).
+#
+# Desde 30-10-2026: el mes completo va al LAKE (Parquet en el bucket 'lake',
+# da/oc/mes=AAAA-MM) y a Supabase suben solo las OC relevantes (grupo,
+# competidores, proveedores objetivo y vehiculos). Antes se reescribian las
+# ~150.000 OC del mes en Supabase todos los dias.
+# Requiere el secret LAKE_EXPORT_KEY (= Vault 'lake_export_key' de AccessRose).
 
 # Los crones son UTC. Chile alterna UTC-3 (sept-abril) y UTC-4 (abril-sept),
 # asi que la hora local se corre una hora dos veces al año. Las horas de los
@@ -33,6 +39,8 @@ jobs:
     env:
       SUPABASE_URL:         ${{ secrets.SUPABASE_URL }}
       SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+      LAKE_EXPORT_KEY:      ${{ secrets.LAKE_EXPORT_KEY }}
+      DA_SOLO_RELEVANTES:   "1"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
