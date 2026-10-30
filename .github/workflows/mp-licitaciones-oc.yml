@@ -13,10 +13,12 @@ name: MP · Licitaciones nuevas (cada 1h)
 # El 16-09-2026, al arreglar los fallos silenciosos, este job pasó de escribir
 # ~400 filas/día a ~400/hora y se volvió el 62% de la carga de la base, que corre
 # en una instancia de 1 GB con 10 GB de datos.
+#
+# 30-10-2026: se quitó el `schedule` propio. Lo dispara pg_cron cada hora
+# (job dispatch-mp-licitaciones, minuto 12) y el cron de GitHub lo volvía a
+# correr a los :15, así que corría dos veces por hora.
 
 on:
-  schedule:
-    - cron: "15 * * * *"
   workflow_dispatch:
 
 concurrency:
