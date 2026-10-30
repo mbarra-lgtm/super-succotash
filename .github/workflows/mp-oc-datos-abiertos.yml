@@ -1,12 +1,16 @@
 name: MP · OC Datos Abiertos (carga mensual masiva)
 
+# Mes vencido completo (se publica cerrado ~dia 20). Igual que la carga diaria:
+# el mes entero va al LAKE (da/oc/mes=AAAA-MM) y a Supabase solo las OC relevantes.
+# Requiere el secret LAKE_EXPORT_KEY (= Vault 'lake_export_key' de AccessRose).
+
 on:
   schedule:
     - cron: "0 6 22 * *"      # día 22 de cada mes, 06:00 UTC (el mes vencido se publica ~día 20)
   workflow_dispatch:
     inputs:
       meses:
-        description: "Meses a cargar, ej: 2025-12,2026-1 (vacío = dic-2025→may-2026)"
+        description: "Meses a cargar, ej: 2025-12,2026-1 (vacío = mes vencido)"
         default: ""
 
 concurrency:
@@ -23,6 +27,8 @@ jobs:
     env:
       SUPABASE_URL:         ${{ secrets.SUPABASE_URL }}
       SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+      LAKE_EXPORT_KEY:      ${{ secrets.LAKE_EXPORT_KEY }}
+      DA_SOLO_RELEVANTES:   "1"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
