@@ -91,7 +91,7 @@ RECONCILE_DELETIONS = os.getenv("RECONCILE_DELETIONS", "1").strip() == "1"
 HOT_ONLY = os.getenv("HOT_ONLY", "0").strip() == "1"
 # Pasos del ciclo hot, en orden. Cambiar la lista NO requiere tocar código:
 # HOT_STEPS="purchase_orders,purchase_order_lines" en el workflow.
-HOT_STEPS_DEFAULT = "purchase_orders,purchase_order_lines,pickings,moves,manufacturing_orders,crm_projects"
+HOT_STEPS_DEFAULT = "purchase_orders,purchase_order_lines,pickings,moves,manufacturing_orders,crm_projects,crm_lead_lines"
 HOT_STEPS_ENV = [s.strip() for s in os.getenv("HOT_STEPS", HOT_STEPS_DEFAULT).split(",") if s.strip()]
 # Minutos mínimos entre reconciliaciones (el job frecuente corre cada 20 min).
 # 0 = sin espaciado. El job diario (FORCE_FULL_RESYNC=1) la corre siempre.
@@ -153,6 +153,9 @@ UBIC_BACKFILL_ALL   = os.getenv("UBIC_BACKFILL_ALL", "0").strip() == "1"
 # Tables
 # =========================
 TB_CRM        = "crm_projects"
+# Líneas "Chasis ofertado" del lead (modelo Studio one2many en crm.lead, 23-nov-2026)
+MODEL_CRM_LEAD_LINES = os.getenv("MODEL_CRM_LEAD_LINES", "x_crm_lead_line_96c8c")
+TB_CRM_LEAD_LINES    = "crm_lead_lines"
 TB_SALES      = "sales_notes"
 TB_MO         = "manufacturing_orders"
 TB_BOM        = "mrp_boms"
@@ -2900,6 +2903,93 @@ def sync_crm_projects_incremental(odoo: OdooClient, chunk: int = 800) -> int:
         total += len(rows)
  
     print(f"✅ CRM incremental: {total} filas (desde write_date>{last})")
+    return total
+
+
+def _crm_lead_lines_parent_field(odoo: OdooClient, model: str) -> Optional[str]:
+    """Nombre del many2one que apunta a crm.lead en el modelo de líneas.
+
+    Studio lo crea como x_crm_lead_id, pero se descubre por fields_get para no
+    depender del nombre: fields_get() del cliente no pide 'relation', así que
+    se llama directo.
+    """
+    try:
+        meta = odoo.execute_kw(model, "fields_get", [], {"attributes": ["type", "relation"]})
+    except Exception as e:
+        print(f"⚠️ {model}: fields_get falló ({e})")
+        return None
+    if meta.get("x_crm_lead_id", {}).get("relation") == "crm.lead":
+        return "x_crm_lead_id"
+    for fname, fmeta in meta.items():
+        if fmeta.get("type") == "many2one" and fmeta.get("relation") == "crm.lead":
+            return fname
+    return None
+
+
+def sync_crm_lead_lines_incremental(odoo: OdooClient, chunk: int = 1000) -> int:
+    """Líneas "Chasis ofertado" del lead (Información Oferta en el form de crm.lead).
+
+    Modelo Studio x_crm_lead_line_96c8c -> tabla crm_lead_lines.
+      x_studio_chasis_ofertado  m2o x_chasis  -> chasis_id / chasis_name
+      x_studio_precio           monetary      -> precio
+      x_studio_cantidad         integer       -> cantidad
+      (subtotal = precio * cantidad, columna generada en Supabase)
+
+    Incremental por write_date de la LÍNEA (editar una línea no siempre toca el
+    write_date del lead). Las líneas borradas las marca reconcile_deletions
+    (está en RECONCILE_TARGETS).
+    """
+    model = MODEL_CRM_LEAD_LINES
+    table = TB_CRM_LEAD_LINES
+
+    parent_field = _crm_lead_lines_parent_field(odoo, model)
+    if not parent_field:
+        print(f"⚠️ {model}: no se encontró el many2one a crm.lead; lead_id quedará NULL")
+
+    desired = [
+        "id", "create_date", "write_date",
+        "x_name", "x_studio_sequence",
+        "x_studio_chasis_ofertado",
+        "x_studio_precio",
+        "x_studio_cantidad",
+    ]
+    if parent_field:
+        desired.append(parent_field)
+    fields = available_fields(odoo, model, desired)
+
+    last = sb_get_max_write_date(table)
+    domain: list = []
+    if last:
+        domain.append(["write_date", ">", last])
+
+    total = 0
+    for batch in iter_search_read_all(odoo, model, domain, fields, chunk=chunk,
+                                      context={"active_test": False}):
+        rows: List[dict] = []
+        for r in batch:
+            lead_id, _ = m2o(r.get(parent_field)) if parent_field else (None, None)
+            chasis_id, chasis_name = m2o(r.get("x_studio_chasis_ofertado"))
+            precio = r.get("x_studio_precio")
+            cantidad = r.get("x_studio_cantidad")
+            rows.append({
+                "odoo_id":     int(r["id"]),
+                "lead_id":     lead_id,
+                "sequence":    r.get("x_studio_sequence") if r.get("x_studio_sequence") is not False else None,
+                "name":        _clean_char(r.get("x_name")),
+                "chasis_id":   chasis_id,
+                "chasis_name": chasis_name,
+                # monetary/integer: False -> NULL; 0 se respeta (puede ser real)
+                "precio":      None if precio is False else precio,
+                "cantidad":    None if cantidad is False else cantidad,
+                "create_date": parse_odoo_dt(r.get("create_date")),
+                "write_date":  parse_odoo_dt(r.get("write_date")),
+                "synced_at":   now_utc_iso(),
+                "is_active":   True,
+            })
+        sb_upsert_basic(table, rows, on_conflict="odoo_id", batch_size=1000)
+        total += len(rows)
+
+    print(f"✅ crm_lead_lines incremental: {total} filas (desde write_date>{last})")
     return total
 
 
@@ -6108,7 +6198,8 @@ RECONCILE_TARGETS = [
     ("sale.order.line",     "sale_order_lines"),
     ("sale.order",          "sales_notes"),
     ("crm.lead",            "crm_projects"),
-    ("mrp.eco",             "mrp_ecos"),
+    (MODEL_CRM_LEAD_LINES,  TB_CRM_LEAD_LINES),
+    ("mrp.eco",          "mrp_ecos"),
     ("mrp.routing.workcenter", "mrp_routing_workcenters"),
 ]
 
@@ -6361,6 +6452,7 @@ HOT_STEP_FNS: Dict[str, Callable[[OdooClient, str], object]] = {
     "manufacturing_orders": lambda odoo, ts: sync_manufacturing_orders_incremental(odoo, chunk=800),
     # Etapas de proyecto (tablero CRE)
     "crm_projects":         lambda odoo, ts: sync_crm_projects_incremental(odoo, chunk=800),
+    "crm_lead_lines":       lambda odoo, ts: sync_crm_lead_lines_incremental(odoo, chunk=1000),
     # Disponibles pero fuera del set por defecto: son más pesados y no suelen
     # cambiar la lectura del día.
     "sales_notes":          lambda odoo, ts: sync_sales_notes_incremental(odoo, chunk=800),
@@ -6489,6 +6581,13 @@ def main():
             backfill_crm_cierre_y_garantias(odoo, chunk=500)
     except Exception as e:
         print(f"⚠️ crm_projects: {e}")
+
+    # Líneas "Chasis ofertado" (chasis / precio / cantidad) — try propio para
+    # que un fallo acá no arrastre al resto del CRM ni viceversa.
+    try:
+        sync_crm_lead_lines_incremental(odoo, chunk=1000)
+    except Exception as e:
+        print(f"⚠️ crm_lead_lines: {e}")
 
     try:
         sync_cgestion_projects_incremental(odoo, chunk=500)
