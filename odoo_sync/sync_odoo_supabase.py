@@ -91,7 +91,7 @@ RECONCILE_DELETIONS = os.getenv("RECONCILE_DELETIONS", "1").strip() == "1"
 HOT_ONLY = os.getenv("HOT_ONLY", "0").strip() == "1"
 # Pasos del ciclo hot, en orden. Cambiar la lista NO requiere tocar código:
 # HOT_STEPS="purchase_orders,purchase_order_lines" en el workflow.
-HOT_STEPS_DEFAULT = "purchase_orders,purchase_order_lines,pickings,moves,manufacturing_orders,crm_projects,crm_lead_lines"
+HOT_STEPS_DEFAULT = "purchase_orders,purchase_order_lines,pickings,moves,manufacturing_orders,crm_projects,crm_lead_lines,budgets"
 HOT_STEPS_ENV = [s.strip() for s in os.getenv("HOT_STEPS", HOT_STEPS_DEFAULT).split(",") if s.strip()]
 # Minutos mínimos entre reconciliaciones (el job frecuente corre cada 20 min).
 # 0 = sin espaciado. El job diario (FORCE_FULL_RESYNC=1) la corre siempre.
@@ -6581,6 +6581,13 @@ HOT_STEP_FNS: Dict[str, Callable[[OdooClient, str], object]] = {
     # Etapas de proyecto (tablero CRE)
     "crm_projects":         lambda odoo, ts: sync_crm_projects_incremental(odoo, chunk=800),
     "crm_lead_lines":       lambda odoo, ts: sync_crm_lead_lines_incremental(odoo, chunk=1000),
+    # Presupuestos por rubro (panel CIP). Es full, pero son ~130 cabeceras y
+    # ~175 lineas: un par de segundos. Las cuentas analiticas van antes porque
+    # un presupuesto recien confirmado desde la NV cuelga de una cuenta nueva.
+    # NO refresca las materializadas (rpc_refresh_budget_control): eso queda en
+    # el ciclo normal, junto al BOM, para que no se lean dos fotos distintas.
+    "budgets":              lambda odoo, ts: (sync_account_analytic_accounts_full(odoo, chunk=800),
+                                              sync_budgets_full(odoo, ts, chunk=BATCH_BUDGETS)),
     # Disponibles pero fuera del set por defecto: son más pesados y no suelen
     # cambiar la lectura del día.
     "sales_notes":          lambda odoo, ts: sync_sales_notes_incremental(odoo, chunk=800),
