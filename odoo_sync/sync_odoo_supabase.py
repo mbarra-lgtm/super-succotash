@@ -193,6 +193,11 @@ TB_ACCOUNT_ANALYTIC_LINES = "account_analytic_lines"
 TB_ODOO_BUDGETS      = "odoo_budgets"
 TB_ODOO_BUDGET_LINES = "odoo_budget_lines"
 BATCH_BUDGETS        = 500
+# Campo de budget.line que dice el rubro (chasis, materia prima, documentacion,
+# otros). Vacio = autodeteccion entre los campos custom x_* de budget.line.
+# Fijarlo apenas se sepa el nombre real para que un campo Studio nuevo no
+# cambie la regla sin aviso.
+BUDGET_LINE_RUBRO_FIELD = os.getenv("BUDGET_LINE_RUBRO_FIELD", "").strip()
 
 
 #Nuevas tablas
@@ -3539,6 +3544,82 @@ def _campos_analiticos_budget_line(meta: Dict[str, Any]) -> List[str]:
     )
 
 
+# Tipos que pueden llevar un rubro. Se dejan fuera binarios, html y los
+# x2many: un rubro es un valor, no una lista.
+_TIPOS_RUBRO = {"char", "text", "selection", "many2one", "integer"}
+
+
+def _campos_rubro_budget_line(meta: Dict[str, Any], excluir: List[str]) -> List[str]:
+    """
+    Campos candidatos a rubro en budget.line (agregado 2026-11-24).
+
+    Los presupuestos nuevos vienen con una linea por rubro (chasis, materia
+    prima, documentacion, otros) dentro de la MISMA cuenta analitica, asi que
+    el rubro no esta en analytic_plan_fields. En Odoo 18 budget.line estandar
+    no tiene un campo de descripcion propio (name es related al presupuesto),
+    asi que el rubro tiene que venir de un campo custom (x_* / x_studio_*).
+
+    Se traen TODOS los custom crudos a extra_fields y se elige uno para la
+    columna rubro (ver _elegir_campo_rubro). Asi, si el nombre cambia o
+    aparece otro campo, el dato ya esta en el espejo y solo cambia la regla.
+    """
+    excl = set(excluir)
+    return sorted(
+        f for f, fm in meta.items()
+        if f.startswith("x_")
+        and f not in excl
+        and fm.get("type") in _TIPOS_RUBRO
+        and not (fm.get("type") == "many2one"
+                 and fm.get("relation") == "account.analytic.account")
+    )
+
+
+def _elegir_campo_rubro(meta: Dict[str, Any], candidatos: List[str]) -> Optional[str]:
+    """
+    Prioridad: 1) BUDGET_LINE_RUBRO_FIELD si existe en el modelo;
+    2) un custom cuyo nombre tecnico o etiqueta diga rubro/categoria/tipo;
+    3) el unico custom, si hay uno solo. Si hay varios y ninguno se llama
+    parecido, NO se adivina: rubro queda NULL y la consola lo dice.
+    """
+    if BUDGET_LINE_RUBRO_FIELD:
+        if BUDGET_LINE_RUBRO_FIELD in meta:
+            return BUDGET_LINE_RUBRO_FIELD
+        print(f"⚠️ presupuestos: BUDGET_LINE_RUBRO_FIELD="
+              f"{BUDGET_LINE_RUBRO_FIELD} no existe en budget.line; se autodetecta.")
+    for clave in ("rubro", "categ", "tipo"):
+        for f in candidatos:
+            etiqueta = str(meta.get(f, {}).get("string") or "").lower()
+            if clave in f.lower() or clave in etiqueta:
+                return f
+    if len(candidatos) == 1:
+        return candidatos[0]
+    return None
+
+
+def _valor_extra(fm: Dict[str, Any], v: Any) -> Any:
+    """Normaliza un valor de Odoo para guardarlo en jsonb sin perder la etiqueta."""
+    if v is False or v is None or v == "":
+        return None
+    tipo = fm.get("type")
+    if tipo == "many2one":
+        _id, _name = m2o(v)
+        return {"id": _id, "name": _name}
+    if tipo == "selection":
+        etiquetas = {str(k): str(l) for k, l in (fm.get("selection") or [])}
+        return {"value": v, "label": etiquetas.get(str(v), str(v))}
+    return v
+
+
+def _texto_rubro(valor: Any) -> Optional[str]:
+    """Lo que va a la columna rubro: la etiqueta legible, no la clave tecnica."""
+    if valor is None:
+        return None
+    if isinstance(valor, dict):
+        t = valor.get("label") or valor.get("name") or valor.get("value")
+        return str(t).strip() or None if t is not None else None
+    return str(valor).strip() or None
+
+
 def sync_budgets_full(odoo: OdooClient, run_ts_iso: str, chunk: int = 500) -> int:
     """
     Full sync de presupuestos analiticos hacia odoo_budgets / odoo_budget_lines.
@@ -3620,8 +3701,9 @@ def sync_budgets_full(odoo: OdooClient, run_ts_iso: str, chunk: int = 500) -> in
     # mandara analytic_plan_fields=None y BORRARA el vinculo analitico de las 48
     # lineas en cada ciclo. Se pide explicitamente aca en vez de tocar el helper
     # compartido, que usan otras 30 funciones.
+    # "selection" se pide para guardar la etiqueta del rubro y no solo la clave.
     meta_line = odoo.execute_kw(line_model, "fields_get", [],
-                                {"attributes": ["string", "type", "relation"]})
+                                {"attributes": ["string", "type", "relation", "selection"]})
     campos_an = [] if legacy else _campos_analiticos_budget_line(meta_line)
     if campos_an:
         print(f"\u2139\ufe0f  presupuestos: campos de plan analitico = {campos_an}")
@@ -3631,6 +3713,25 @@ def sync_budgets_full(odoo: OdooClient, run_ts_iso: str, chunk: int = 500) -> in
               "account.analytic.account. Si analytic_distribution tambien viene "
               "vacio, las lineas quedaran sin cuenta: revisar "
               "v_budget_lines_sin_analitica.")
+
+    # Orden de la linea dentro del presupuesto (estandar en budget.line).
+    desired_line += ["sequence"]
+
+    # Rubro de la linea (ver _campos_rubro_budget_line).
+    campos_extra = _campos_rubro_budget_line(meta_line, excluir=desired_line)
+    campo_rubro = _elegir_campo_rubro(meta_line, campos_extra)
+    if campo_rubro and campo_rubro not in campos_extra:
+        campos_extra.append(campo_rubro)   # fijado por env y no es x_*
+    if campos_extra:
+        desc = ", ".join(f"{f} ({meta_line[f].get('type')}: "
+                         f"{meta_line[f].get('string')})" for f in campos_extra)
+        print(f"\u2139\ufe0f  presupuestos: campos custom de budget.line = {desc}")
+        print(f"\u2139\ufe0f  presupuestos: campo de rubro = {campo_rubro or 'NINGUNO'}")
+        desired_line += campos_extra
+    else:
+        print("\u26a0\ufe0f presupuestos: budget.line no tiene campos custom (x_*). "
+              "El rubro no existe en Odoo: hay que crearlo (Studio) y que la "
+              "accion que arma el presupuesto desde la NV lo llene.")
 
     fields_line = available_fields(odoo, line_model, desired_line)
 
@@ -3698,6 +3799,18 @@ def sync_budgets_full(odoo: OdooClient, run_ts_iso: str, chunk: int = 500) -> in
             # deteccion deja de poder vaciar el vinculo.
             if planes:
                 fila["analytic_plan_fields"] = planes
+
+            _seq = r.get("sequence")
+            fila["sequence"] = int(_seq) if isinstance(_seq, int) and not isinstance(_seq, bool) else None
+
+            # Rubro: las claves solo viajan si Odoo expone campos custom. Si un
+            # ciclo no los detecta, el RPC conserva lo que ya habia.
+            if campos_extra:
+                extra = {f: _valor_extra(meta_line[f], r.get(f))
+                         for f in campos_extra if f in r}
+                fila["extra_fields"] = extra or None
+                fila["rubro_field"] = campo_rubro
+                fila["rubro"] = _texto_rubro(extra.get(campo_rubro)) if campo_rubro else None
             rows_line.append(fila)
 
     sb_rpc_upsert("rpc_upsert_odoo_budget_lines", rows_line, batch_size=500)
@@ -3736,6 +3849,21 @@ def sync_budgets_full(odoo: OdooClient, run_ts_iso: str, chunk: int = 500) -> in
     if multi:
         print(f"ℹ️  presupuestos: {len(multi)} lineas con mas de un plan analitico; "
               f"la vista elige la cuenta de tipo PROYECTO.")
+
+    # Rubro: solo importa en presupuestos de mas de una linea. Una linea sin
+    # rubro ahi es monto que el panel por rubro no puede asignar.
+    if campos_extra:
+        por_ppto: Dict[Any, int] = {}
+        for r in rows_line:
+            por_ppto[r["budget_id"]] = por_ppto.get(r["budget_id"], 0) + 1
+        sin_rubro = [r for r in rows_line
+                     if por_ppto.get(r["budget_id"], 0) > 1 and not r.get("rubro")]
+        con_rubro = sum(1 for r in rows_line if r.get("rubro"))
+        print(f"ℹ️  presupuestos: {con_rubro}/{len(rows_line)} lineas con rubro.")
+        if sin_rubro:
+            ids = sorted({r["budget_id"] for r in sin_rubro})
+            print(f"⚠️ presupuestos: {len(sin_rubro)} lineas de presupuestos multi-linea "
+                  f"sin rubro (budget_id {ids[:15]}{'...' if len(ids) > 15 else ''}).")
 
     return len(rows_head) + len(rows_line)
 
