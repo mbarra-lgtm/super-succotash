@@ -90,7 +90,8 @@ def rpc(funcion: str, args: dict):
 #: Sin esta exclusión el scraper de actas se come los feeds y los marca en
 #: error — pasó en la corrida del 31-08. Los avisos legales de Defensa
 #: (ingesta_avisos_defensa.py) también llegan por RSS de Google News.
-TIPOS_NO_DOCUMENTALES = ("rss_prensa", "aviso_legal")
+#: El Plan Anual de Compras (ingesta_pac.py) es una tabla, no un documento.
+TIPOS_NO_DOCUMENTALES = ("rss_prensa", "aviso_legal", "plan_compras")
 
 
 def fuentes_pendientes(slug: str | None = None,

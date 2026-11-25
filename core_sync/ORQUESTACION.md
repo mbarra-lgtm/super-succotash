@@ -88,6 +88,66 @@ Cosas que hay que saber:
 - Un aviso puntual se carga a mano con
   `python ingesta_avisos_defensa.py --url <url del aviso o del PDF>`.
 
+## Cuarta vía: Plan Anual de Compras (PAC)
+
+`ingesta_pac.py` (25-11-2026). Cada organismo publica en enero lo que piensa
+comprar en el año, línea por línea, con monto y mes. Es la señal más temprana
+*dentro* de Mercado Público, pero indicativa: el PAC no obliga a comprar y el
+organismo lo cambia cuando quiere. Medido con "ambulancias" (23-11-2026):
+cerca de un tercio de las líneas con el mes vencido terminó en licitación.
+
+```
+buscador PAC ──> core_pac_lineas ──fn_core_pac_procesar()──> estado + codigo_mp ──> core_senales
+(~45 consultas:   (foto diaria,      organismo, retiradas,                          (fuente_tipo
+ rubros 173/191    upsert por        reprogramadas, cruce                            'plan_compras')
+ + palabras)       linea_key)        con mp_licitaciones)
+```
+
+| | Avisos de Defensa | PAC |
+|---|---|---|
+| Fuente | PDF en un diario | Export público `VerExcelOportunidades` (tabla HTML) |
+| Modelo | Claude lee la tabla | Ninguno: regex sobre el nombre de la línea |
+| Etapa | `licitacion_publicada` | `idea` (pasa a `licitacion_publicada` cuando se encuentra la licitación) |
+| Confianza | 0,95 | 0,6 planificada · 0,35 vencida sin licitar · 0,9 licitada |
+
+Estados de una línea (`core_pac_lineas.estado`):
+
+- **planificada**: el mes todavía no pasa (más 60 días de gracia).
+- **vencida_sin_licitar**: pasó el mes y no hay licitación del organismo que
+  calce. Es la señal comercial más interesante: el dinero estaba en el plan.
+  Puede haberse comprado por convenio marco o trato directo (no se cruza todavía).
+- **licitada**: hay una licitación del mismo organismo (por código MP), publicada
+  desde 4 meses antes del mes planificado, cuyo nombre calza con la categoría.
+- **retirada**: la línea dejó de aparecer en el PAC. Sólo se marca si *todas*
+  las consultas respondieron; si la señal seguía `nueva`, se descarta sola.
+- **reprogramada**: el organismo cambió el mes o el monto. Las líneas no tienen
+  ID, así que aparece una línea nueva: se une a la vieja por organismo + nombre
+  y la señal se mueve a la nueva en vez de duplicarse.
+
+Cosas que hay que saber:
+
+- **El buscador distingue tildes**: "retén móvil" trae filas, "reten movil" no.
+  Cada término con tilde va en las dos formas en `PALABRAS`.
+- **Sin resultados devuelve `<div></div>`** (15 bytes), no un error. Cualquier
+  otra respuesta sin filas se trata como falla de la consulta.
+- **Organismo en cuatro pasos**: nombre exacto en `core_organismos` → catálogo
+  de compradores de `mp_licitacion_comprador` (nombre de organismo o de unidad)
+  → municipalidad por comuna ("MUNICIPALIDAD DE LOS ANGELES AREA SALUD") → se
+  crea el organismo con `origen = 'pac'`.
+- **Señales sólo para lo vigente**: planificadas y vencidas de los últimos 180
+  días. Lo ya licitado al detectarlo y lo vencido hace más tiempo queda en la
+  tabla para medir cumplimiento, sin señal.
+- **Score**: ambulancia/clínica/carro bomba/rescate/blindado/carrocería/móvil
+  policial = encaje alto (prioridad 2); minibús/furgón/van adaptada = medio
+  (prioridad 4, casi nunca llega al correo). Una línea planificada de $500
+  millones o más ronda 56 y entra al digest (umbral 45); una de $100 millones ronda 47. Las vencidas bajan a ~35-40.
+- **Enero**: el PAC del año nuevo se publica en enero. Hasta marzo el script
+  procesa también el plan del año anterior, porque las líneas de noviembre y
+  diciembre se licitan en enero o febrero.
+- `v_core_pac_cumplimiento` da el % de líneas vencidas que llegaron a
+  licitación, por tipo de organismo y categoría. Es la respuesta con datos
+  propios a "¿cuánto del PAC termina en licitación?".
+
 ## Secretos
 
 Además de los de `mp_sync` (`SUPABASE_URL`, `SUPABASE_SERVICE_KEY`), este
@@ -101,7 +161,7 @@ pipeline necesita uno nuevo:
 
 | Archivo | Cadencia (UTC) | Scripts |
 |---|---|---|
-| `core-radar.yml` | 11:00 y 23:00 L-V (≈07:00 y 19:00 CL) | `scrape_core.py` + `clasificar_senales.py` + `ingesta_prensa.py` + `ingesta_avisos_defensa.py` |
+| `core-radar.yml` | 11:00 y 23:00 L-V (≈07:00 y 19:00 CL) | `scrape_core.py` + `clasificar_senales.py` + `ingesta_prensa.py` + `ingesta_avisos_defensa.py` + `ingesta_pac.py` (1 vez al día) |
 
 La cadencia real por fuente la decide la base: `core_sources.frecuencia_horas`
 (12 h para regiones prioritarias, 24 h para el resto). El workflow solo pregunta
@@ -123,6 +183,10 @@ La cadencia real por fuente la decide la base: `core_sources.frecuencia_horas`
 | `v_core_radar_diario` | Lo detectado ayer, para el correo |
 | `v_core_fuentes_salud` | Semáforo por fuente |
 | `v_core_defensa_llamados` | Llamados de Defensa con número, cierre, días para el cierre y correo |
+| `core_pac_lineas` | Foto diaria del Plan Anual de Compras: líneas, estado, organismo y licitación encontrada |
+| `fn_core_pac_procesar()` | Organismo, retiradas, reprogramadas, cruce con `mp_licitaciones` y estado |
+| `v_core_pac_lineas` | Detalle de líneas con organismo, región y señal |
+| `v_core_pac_cumplimiento` | % del PAC que termina en licitación, por tipo de organismo y categoría |
 
 ## Lo que enseñó el piloto
 
